@@ -1,3 +1,5 @@
+> **个人定制 Fork**：本仓库保留用量读取修复和应用内去推广定制。请使用自己的源码构建版；下方上游下载链接及应用内安装包更新不包含这些定制。同步上游、构建和回退见 [Fork 维护说明](docs/fork-maintenance.md)。
+
 <p align="center">
   <img src="docs/images/readme-preview/hero.svg" alt="Codex++ — 让 Codex 更顺手。供应商与模型、工作流增强、拓展与个性化。" width="100%">
 </p>
