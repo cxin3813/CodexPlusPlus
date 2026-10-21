@@ -1351,3 +1351,155 @@ fn thread_usage_live_reports_missing_sessions_without_history_payload() {
     assert_eq!(value["events"], json!([]));
     assert!(value.get("history").is_none());
 }
+
+fn usage_candidate_adapter(primary: &Path, fallback: &Path, root: &Path) -> SQLiteStorageAdapter {
+    SQLiteStorageAdapter::new(primary, BackupStore::new(root.join("backups")))
+        .with_allowed_db_paths([fallback.to_path_buf()])
+}
+
+fn assert_usage_rollout(adapter: &SQLiteStorageAdapter, expected: &Path) {
+    for value in [
+        adapter.codex_thread_usage_live(&session("local:t1", "Usage")),
+        adapter.codex_thread_usage_history(&session("local:t1", "Usage")),
+    ] {
+        assert_eq!(value["status"], "ok", "{value}");
+        assert_eq!(value["rollout_path"], expected.to_string_lossy().as_ref());
+    }
+}
+
+#[test]
+fn thread_usage_finds_session_in_another_database() {
+    let tmp = tempdir().unwrap();
+    let primary = tmp.path().join("old.sqlite");
+    let fallback = tmp.path().join("current.sqlite");
+    let rollout = tmp.path().join("current.jsonl");
+    fs::write(&rollout, "").unwrap();
+    create_codex_thread_db(&primary, &rollout);
+    Connection::open(&primary)
+        .unwrap()
+        .execute("DELETE FROM threads", [])
+        .unwrap();
+    create_codex_thread_db(&fallback, &rollout);
+    let adapter = usage_candidate_adapter(&primary, &fallback, tmp.path());
+    assert_usage_rollout(&adapter, &rollout);
+}
+
+#[test]
+fn thread_usage_prefers_newest_valid_record_without_merging_events() {
+    let tmp = tempdir().unwrap();
+    let primary = tmp.path().join("old.sqlite");
+    let fallback = tmp.path().join("current.sqlite");
+    let old = tmp.path().join("old.jsonl");
+    let latest = tmp.path().join("current.jsonl");
+    let event = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":20,\"output_tokens\":10,\"total_tokens\":30}}}}\n";
+    fs::write(&old, event.repeat(2)).unwrap();
+    fs::write(&latest, event).unwrap();
+    create_codex_thread_db(&primary, &old);
+    create_codex_thread_db(&fallback, &latest);
+    let db = Connection::open(&fallback).unwrap();
+    db.execute("UPDATE threads SET updated_at_ms = 200000", [])
+        .unwrap();
+    drop(db);
+    let adapter = usage_candidate_adapter(&primary, &fallback, tmp.path());
+    assert_usage_rollout(&adapter, &latest);
+    assert_eq!(
+        adapter.codex_thread_usage_live(&session("t1", "Usage"))["events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        adapter.codex_thread_usage_history(&session("t1", "Usage"))["history"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn thread_usage_skips_empty_missing_and_unsupported_candidates() {
+    let tmp = tempdir().unwrap();
+    let primary = tmp.path().join("primary.sqlite");
+    let fallback = tmp.path().join("fallback.sqlite");
+    let rollout = tmp.path().join("current.jsonl");
+    fs::write(&rollout, "").unwrap();
+    create_codex_thread_db(&fallback, &rollout);
+    let adapter = usage_candidate_adapter(&primary, &fallback, tmp.path());
+    assert_usage_rollout(&adapter, &rollout);
+    assert!(
+        !primary.exists(),
+        "read-only discovery must not create missing databases"
+    );
+    create_codex_thread_db(&primary, Path::new(""));
+    assert_usage_rollout(&adapter, &rollout);
+    let db = Connection::open(&primary).unwrap();
+    db.execute(
+        "UPDATE threads SET rollout_path = ?1, updated_at_ms = 300000",
+        [tmp.path().join("missing.jsonl").to_string_lossy().as_ref()],
+    )
+    .unwrap();
+    assert_usage_rollout(&adapter, &rollout);
+    db.execute("DROP TABLE threads", []).unwrap();
+    assert_usage_rollout(&adapter, &rollout);
+}
+
+#[test]
+fn thread_usage_uses_seconds_timestamp_when_milliseconds_column_is_absent() {
+    let tmp = tempdir().unwrap();
+    let primary = tmp.path().join("primary.sqlite");
+    let fallback = tmp.path().join("fallback.sqlite");
+    let old = tmp.path().join("old.jsonl");
+    let latest = tmp.path().join("latest.jsonl");
+    fs::write(&old, "").unwrap();
+    fs::write(&latest, "").unwrap();
+    create_codex_thread_db(&primary, &old);
+    create_codex_thread_db(&fallback, &latest);
+    let db = Connection::open(&fallback).unwrap();
+    db.execute("ALTER TABLE threads DROP COLUMN updated_at_ms", [])
+        .unwrap();
+    db.execute("UPDATE threads SET updated_at = 300", [])
+        .unwrap();
+    assert_usage_rollout(
+        &usage_candidate_adapter(&primary, &fallback, tmp.path()),
+        &latest,
+    );
+}
+
+#[test]
+fn thread_usage_distinguishes_missing_thread_from_empty_rollout_path() {
+    let tmp = tempdir().unwrap();
+    let primary = tmp.path().join("primary.sqlite");
+    create_codex_thread_db(&primary, Path::new(""));
+    let adapter = SQLiteStorageAdapter::new(&primary, BackupStore::new(tmp.path().join("backups")));
+    assert_eq!(
+        adapter.codex_thread_usage_live(&session("missing", "Missing"))["message"],
+        "Thread not found in local storage"
+    );
+    assert_eq!(
+        adapter.codex_thread_usage_live(&session("t1", "Empty"))["message"],
+        "Thread rollout path is empty"
+    );
+}
+
+#[test]
+fn thread_usage_reports_corrupt_candidate_instead_of_hiding_database_error() {
+    let tmp = tempdir().unwrap();
+    let primary = tmp.path().join("corrupt.sqlite");
+    let fallback = tmp.path().join("fallback.sqlite");
+    let rollout = tmp.path().join("current.jsonl");
+    fs::write(&primary, "not a sqlite database").unwrap();
+    fs::write(&rollout, "").unwrap();
+    create_codex_thread_db(&fallback, &rollout);
+    let value = usage_candidate_adapter(&primary, &fallback, tmp.path())
+        .codex_thread_usage_live(&session("t1", "Usage"));
+    assert_eq!(value["status"], "failed");
+    assert!(
+        value["message"]
+            .as_str()
+            .unwrap()
+            .contains("not a database"),
+        "{value}"
+    );
+}

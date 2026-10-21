@@ -342,56 +342,103 @@ impl SQLiteStorageAdapter {
         SessionRef::new(id, row_title.unwrap_or_else(|| title.to_string())).ok()
     }
 
-    /// 解析会话对应的 rollout 文件。
-    ///
-    /// `Unavailable` 里已经是可直接返回前端的失败对象：语义是「本地没有这个会话的
-    /// 历史」，不是后端故障，所以不走 anyhow；真正的 IO / SQLite 故障走 Err。
+    /// 按会话定位候选库中的最新有效 rollout；只影响用量读取，不改变删除/恢复的选库。
+    /// SQLite、权限等故障直接上报；缺失的记录和文件才允许继续查其他候选。
     fn codex_thread_rollout(&self, session: &SessionRef) -> anyhow::Result<CodexThreadRollout> {
-        if !self.db_path.exists() {
-            return Ok(CodexThreadRollout::Unavailable(json!({
-                "status": "failed",
-                "session_id": session.session_id,
-                "message": self.database_not_found_message(),
-            })));
-        }
-        let db = Connection::open(&self.db_path)?;
-        if schema_kind(&db)? != Some(SchemaKind::CodexThreads)
-            || !has_columns(&db, "threads", &["rollout_path"])?
-        {
-            return Ok(CodexThreadRollout::Unavailable(json!({
-                "status": "failed",
-                "session_id": session.session_id,
-                "message": "Unsupported local storage schema",
-            })));
-        }
         let thread_id = normalize_codex_thread_id(&session.session_id);
-        let rollout_path: Option<String> = db
-            .query_row(
-                "SELECT rollout_path FROM threads WHERE id = ?1",
-                [&thread_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(rollout_path) = rollout_path.filter(|path| !path.trim().is_empty()) else {
-            return Ok(CodexThreadRollout::Unavailable(json!({
-                "status": "failed",
-                "session_id": thread_id,
-                "message": "Thread rollout path is empty",
-            })));
-        };
-        let rollout = PathBuf::from(&rollout_path);
-        if !rollout.is_file() {
-            return Ok(CodexThreadRollout::Unavailable(json!({
-                "status": "failed",
-                "session_id": thread_id,
-                "message": format!("rollout file not found: {rollout_path}"),
-            })));
+        let mut candidates = Vec::new();
+        let mut found_database = false;
+        let mut supported_schema = false;
+        for db_path in &self.allowed_db_paths {
+            if !db_path.try_exists()? {
+                continue;
+            }
+            found_database = true;
+            let db = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|error| anyhow::anyhow!("{}: {error}", db_path.display()))?;
+            let mut read_candidate = || -> anyhow::Result<_> {
+                // 不用 has_table 的布尔探测，避免把损坏/锁定等 SQLite 错误当作无记录。
+                let has_threads = db
+                    .query_row(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads'",
+                        [],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !has_threads {
+                    return Ok(None);
+                }
+                let columns = table_columns(&db, "threads")?;
+                if !["id", "rollout_path"]
+                    .iter()
+                    .all(|name| columns.iter().any(|column| column == name))
+                {
+                    return Ok(None);
+                }
+                supported_schema = true;
+                let updated = if columns.iter().any(|column| column == "updated_at_ms") {
+                    "updated_at_ms"
+                } else if columns.iter().any(|column| column == "updated_at") {
+                    "updated_at * 1000"
+                } else if columns.iter().any(|column| column == "created_at_ms") {
+                    "created_at_ms"
+                } else {
+                    "NULL"
+                };
+                Ok(db
+                    .query_row(
+                        &format!("SELECT {updated}, rollout_path FROM threads WHERE id = ?1"),
+                        [&thread_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<i64>>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                            ))
+                        },
+                    )
+                    .optional()?)
+            };
+            if let Some(candidate) = read_candidate()
+                .map_err(|error| anyhow::anyhow!("{}: {error}", db_path.display()))?
+            {
+                candidates.push(candidate);
+            }
         }
-        Ok(CodexThreadRollout::Ready {
-            thread_id,
-            rollout_path,
-            rollout,
-        })
+        // 稳定排序：与会话列表一致，时间相同保留候选库顺序。
+        candidates.sort_by(|left, right| right.0.cmp(&left.0));
+        let mut message = if !found_database {
+            self.database_not_found_message()
+        } else if !supported_schema {
+            "Unsupported local storage schema".to_string()
+        } else {
+            "Thread not found in local storage".to_string()
+        };
+        for (_, rollout_path) in candidates {
+            let Some(rollout_path) = rollout_path.filter(|path| !path.trim().is_empty()) else {
+                message = "Thread rollout path is empty".to_string();
+                continue;
+            };
+            let rollout = PathBuf::from(&rollout_path);
+            match fs::metadata(&rollout) {
+                Ok(metadata) if metadata.is_file() => {
+                    return Ok(CodexThreadRollout::Ready {
+                        thread_id,
+                        rollout_path,
+                        rollout,
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(anyhow::anyhow!("{rollout_path}: {error}")),
+            }
+            message = format!("rollout file not found: {rollout_path}");
+        }
+        Ok(CodexThreadRollout::Unavailable(json!({
+            "status": "failed",
+            "session_id": thread_id,
+            "message": message,
+        })))
     }
 
     pub fn codex_thread_usage_history(&self, session: &SessionRef) -> serde_json::Value {
