@@ -272,3 +272,9 @@ async fn fetch_ad_list_tries_backup_url_when_primary_fails() {
     let ads = payload["ads"].as_array().unwrap();
     assert!(ads.iter().any(|ad| ad["id"] == json!("backup-ad")));
 }
+
+#[tokio::test]
+async fn default_ad_entry_point_returns_no_promotions() {
+    let payload = codex_plus_core::ads::fetch_ad_list().await.unwrap();
+    assert_eq!(payload, json!({ "version": 1, "ads": [] }));
+}

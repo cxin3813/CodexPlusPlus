@@ -1111,14 +1111,28 @@ fn injection_script_marks_diagnostic_build_and_reports_script_loaded() {
 }
 
 #[test]
-fn injection_script_fetches_ads_without_bridge() {
+fn injection_script_omits_ads_and_preserves_functional_extensions() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("directFetchCodexPlusAds"));
-    assert!(script.contains("cacheBustCodexPlusAdUrl"));
-    assert!(script.contains("Date.now()"));
-    assert!(script.contains("BigPizzaV3/Ad-List"));
-    assert!(!script.contains("codexPlusAds = normalizeCodexPlusAds(await postJson(\"/ads\", {}));"));
+    for removed in [
+        "fetchCodexPlusAds",
+        "directFetchCodexPlusAds",
+        "cacheBustCodexPlusAdUrl",
+        "BigPizzaV3/Ad-List",
+        "postJson(\"/ads\"",
+        "data-codex-plus-panel=\"sponsor\"",
+        "data-codex-plus-ad-url",
+    ] {
+        assert!(!script.contains(removed), "removed promotion leaked: {removed}");
+    }
+    for retained in [
+        "function openCodexPlusExtensions()",
+        "function renderCodexPlusExtensionsOverview()",
+        "async function loadScriptMarket(force = false)",
+        "function installCodexPlusRailNavigation()",
+    ] {
+        assert!(script.contains(retained), "functional injection missing: {retained}");
+    }
 }
 
 #[test]

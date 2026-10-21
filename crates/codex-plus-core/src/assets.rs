@@ -200,6 +200,15 @@ fn dream_skin_target_assets(
     }
 }
 
+fn dream_skin_render_theme_json(settings: &BackendSettings) -> String {
+    // 只净化渲染副本，兼容旧设置和导入主题，不改写用户保存的数据。
+    let mut theme = settings.codex_app_dream_skin_theme_config.clone();
+    for key in ["promoTitle", "promoSub", "promoUrl"] {
+        theme.extra_fields.remove(key);
+    }
+    serde_json::to_string(&theme).expect("dream skin render theme should serialize")
+}
+
 fn dream_skin_target_runtime_script(settings: &BackendSettings, include_art: bool) -> String {
     if !settings.codex_app_dream_skin_enabled || settings.codex_app_dream_skin_paused {
         return String::new();
@@ -208,8 +217,7 @@ fn dream_skin_target_runtime_script(settings: &BackendSettings, include_art: boo
     let (engine, renderer, base_css) = dream_skin_target_assets(settings);
     let managed_css = managed_dream_skin_css(settings);
     let css = format!("{base_css}\n{managed_css}");
-    let theme = serde_json::to_string(&settings.codex_app_dream_skin_theme_config)
-        .expect("dream skin target theme should serialize");
+    let theme = dream_skin_render_theme_json(settings);
     let style_revision = dream_skin_content_signature(css.as_bytes());
     let payload_revision =
         dream_skin_target_payload_signature(settings, engine, &style_revision, &theme);
@@ -533,7 +541,7 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
     let image_overlay = image_overlay_config(helper_port, settings);
     let dream_skin_art = dream_skin_art_data_uri(settings);
     let dream_skin_art_signature = dream_skin_art_content_signature(settings);
-    let dream_skin_theme = &settings.codex_app_dream_skin_theme_config;
+    let dream_skin_theme = dream_skin_render_theme_json(settings);
     let dream_skin_target_runtime = dream_skin_target_runtime_script(settings, false);
     let paste_fix = paste_fix_enabled_config(settings);
     let force_chinese_locale = force_chinese_locale_config(settings);
@@ -557,7 +565,7 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
         serde_json::to_string(&dream_skin_art).expect("dream skin art should serialize"),
         serde_json::to_string(&dream_skin_art_signature)
             .expect("dream skin art signature should serialize"),
-        serde_json::to_string(dream_skin_theme).expect("dream skin theme should serialize"),
+        dream_skin_theme,
         serde_json::to_string(&paste_fix).expect("paste fix config should serialize"),
         serde_json::to_string(&force_chinese_locale)
             .expect("force Chinese locale config should serialize"),
@@ -604,8 +612,7 @@ pub fn dream_skin_art_content_signature(settings: &BackendSettings) -> String {
 
 pub fn dream_skin_runtime_content_signature(settings: &BackendSettings) -> String {
     let (engine, _, css) = dream_skin_target_assets(settings);
-    let theme = serde_json::to_string(&settings.codex_app_dream_skin_theme_config)
-        .expect("dream skin target theme should serialize");
+    let theme = dream_skin_render_theme_json(settings);
     let style_revision = dream_skin_content_signature(css.as_bytes());
     dream_skin_target_payload_signature(settings, engine, &style_revision, &theme)
 }
@@ -675,6 +682,36 @@ fn image_content_type(path: &Path) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_theme_promotions_never_reach_renderers_or_live_updates() {
+        let mut settings = BackendSettings::default();
+        let saved_promotion = json!({
+            "promoTitle": "感谢 Passion8 赞助",
+            "promoSub": "passion8.cc",
+            "promoUrl": "https://passion8.cc/register?aff=TuPe",
+        });
+        settings.codex_app_dream_skin_theme_config.extra_fields.extend(
+            saved_promotion.as_object().unwrap().clone(),
+        );
+        let original = settings.codex_app_dream_skin_theme_config.clone();
+        let disabled_script = injection_script_with_settings(57321, &settings);
+        settings.codex_app_dream_skin_enabled = true;
+        let enabled_script = injection_script_with_settings(57321, &settings);
+        let live_script = dream_skin_live_update_script(&settings, false);
+        for script in [disabled_script, enabled_script, live_script] {
+            assert!(!script.contains("Passion8"));
+            assert!(!script.contains("passion8.cc"));
+            assert!(!script.contains("promoTitle"));
+            assert!(script.contains("CODEX DREAM SKIN"));
+        }
+        assert_eq!(settings.codex_app_dream_skin_theme_config.extra_fields, original.extra_fields);
+        let promoted_signature = dream_skin_runtime_content_signature(&settings);
+        for key in ["promoTitle", "promoSub", "promoUrl"] {
+            settings.codex_app_dream_skin_theme_config.extra_fields.remove(key);
+        }
+        assert_eq!(promoted_signature, dream_skin_runtime_content_signature(&settings));
+    }
 
     #[test]
     fn injection_does_not_project_retired_plugin_cache() {
