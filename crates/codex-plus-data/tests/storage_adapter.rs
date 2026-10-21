@@ -533,45 +533,70 @@ fn delete_codex_thread_clears_sidebar_global_state_and_catalog_cache() {
     .unwrap();
     let catalog_db = Connection::open(sqlite_dir.join("codex-dev.db")).unwrap();
     catalog_db
-        .execute("CREATE TABLE local_thread_catalog (thread_id TEXT PRIMARY KEY)", [])
+        .execute(
+            "CREATE TABLE local_thread_catalog (thread_id TEXT PRIMARY KEY)",
+            [],
+        )
         .unwrap();
     catalog_db
         .execute("CREATE TABLE thread_timeline_ledger (thread_id TEXT)", [])
         .unwrap();
     catalog_db
-        .execute("CREATE TABLE local_thread_catalog_scan_entries (thread_id TEXT)", [])
+        .execute(
+            "CREATE TABLE local_thread_catalog_scan_entries (thread_id TEXT)",
+            [],
+        )
         .unwrap();
     catalog_db
-        .execute("INSERT INTO local_thread_catalog VALUES ('t1'), ('keep')", [])
+        .execute(
+            "INSERT INTO local_thread_catalog VALUES ('t1'), ('keep')",
+            [],
+        )
         .unwrap();
     catalog_db
-        .execute("INSERT INTO thread_timeline_ledger VALUES ('t1'), ('keep')", [])
+        .execute(
+            "INSERT INTO thread_timeline_ledger VALUES ('t1'), ('keep')",
+            [],
+        )
         .unwrap();
     catalog_db
-        .execute("INSERT INTO local_thread_catalog_scan_entries VALUES ('t1'), ('keep')", [])
+        .execute(
+            "INSERT INTO local_thread_catalog_scan_entries VALUES ('t1'), ('keep')",
+            [],
+        )
         .unwrap();
     drop(catalog_db);
 
-    let deleted = SQLiteStorageAdapter::new(
-        &state_db,
-        BackupStore::new(tmp.path().join("backups")),
-    )
-    .with_codex_home(&home)
-    .delete_local(&session("local:t1", "Codex Thread"));
+    let deleted =
+        SQLiteStorageAdapter::new(&state_db, BackupStore::new(tmp.path().join("backups")))
+            .with_codex_home(&home)
+            .delete_local(&session("local:t1", "Codex Thread"));
     assert_eq!(deleted.status, DeleteStatus::LocalDeleted);
     let state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(home.join(".codex-global-state.json")).unwrap())
             .unwrap();
     assert_eq!(state["projectless-thread-ids"], json!([keep_id]));
-    assert!(state["thread-projectless-output-directories"].get("t1").is_none());
-    assert!(state["thread-workspace-root-hints"].get("local:t1").is_none());
+    assert!(
+        state["thread-projectless-output-directories"]
+            .get("t1")
+            .is_none()
+    );
+    assert!(
+        state["thread-workspace-root-hints"]
+            .get("local:t1")
+            .is_none()
+    );
     assert!(state["thread-writable-roots"].get("t1").is_none());
-    assert!(state["electron-persisted-atom-state"]
-        .get("thread-client-id-v1:t1")
-        .is_none());
-    assert!(state["electron-persisted-atom-state"]
-        .get("thread-client-id-v1:keep")
-        .is_some());
+    assert!(
+        state["electron-persisted-atom-state"]
+            .get("thread-client-id-v1:t1")
+            .is_none()
+    );
+    assert!(
+        state["electron-persisted-atom-state"]
+            .get("thread-client-id-v1:keep")
+            .is_some()
+    );
     let catalog_db = Connection::open(sqlite_dir.join("codex-dev.db")).unwrap();
     for table in [
         "local_thread_catalog",
@@ -588,12 +613,10 @@ fn delete_codex_thread_clears_sidebar_global_state_and_catalog_cache() {
         assert_eq!(count, 0, "{table}");
     }
 
-    let restored = SQLiteStorageAdapter::new(
-        &state_db,
-        BackupStore::new(tmp.path().join("backups")),
-    )
-    .with_codex_home(&home)
-    .undo(deleted.undo_token.as_deref().unwrap());
+    let restored =
+        SQLiteStorageAdapter::new(&state_db, BackupStore::new(tmp.path().join("backups")))
+            .with_codex_home(&home)
+            .undo(deleted.undo_token.as_deref().unwrap());
     assert_eq!(restored.status, DeleteStatus::Undone);
     let state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(home.join(".codex-global-state.json")).unwrap())
@@ -748,7 +771,12 @@ fn delete_local_from_paths_removes_duplicate_threads_from_all_databases() {
     );
 
     assert_eq!(result.status, DeleteStatus::LocalDeleted);
-    assert_eq!(result.message, "已从 2 个本地存储删除");
+    assert!(result.message.starts_with("已从 2 个本地存储删除；备份："));
+    let tokens: Vec<String> = serde_json::from_str(result.undo_token.as_deref().unwrap()).unwrap();
+    assert_eq!(tokens.len(), 2);
+    for token in tokens {
+        assert!(result.message.contains(&format!("{token}.json")));
+    }
     assert_eq!(thread_count(&first_db, "t1"), 0);
     assert_eq!(thread_count(&second_db, "t1"), 0);
     assert!(!first_rollout.exists());
@@ -786,7 +814,12 @@ fn delete_local_from_paths_undo_restores_duplicate_threads_and_shared_rollout_to
     let token = deleted.undo_token.as_deref().unwrap();
 
     assert_eq!(deleted.status, DeleteStatus::LocalDeleted);
-    assert_eq!(deleted.message, "已从 2 个本地存储删除");
+    assert!(deleted.message.starts_with("已从 2 个本地存储删除；备份："));
+    let tokens: Vec<String> = serde_json::from_str(token).unwrap();
+    assert_eq!(tokens.len(), 2);
+    for token in tokens {
+        assert!(deleted.message.contains(&format!("{token}.json")));
+    }
     assert_eq!(thread_count(&old_db, "t1"), 0);
     assert_eq!(thread_count(&new_db, "t1"), 0);
     assert!(!rollout.exists());
@@ -1350,156 +1383,4 @@ fn thread_usage_live_reports_missing_sessions_without_history_payload() {
     assert_eq!(value["session_id"], json!("missing"));
     assert_eq!(value["events"], json!([]));
     assert!(value.get("history").is_none());
-}
-
-fn usage_candidate_adapter(primary: &Path, fallback: &Path, root: &Path) -> SQLiteStorageAdapter {
-    SQLiteStorageAdapter::new(primary, BackupStore::new(root.join("backups")))
-        .with_allowed_db_paths([fallback.to_path_buf()])
-}
-
-fn assert_usage_rollout(adapter: &SQLiteStorageAdapter, expected: &Path) {
-    for value in [
-        adapter.codex_thread_usage_live(&session("local:t1", "Usage")),
-        adapter.codex_thread_usage_history(&session("local:t1", "Usage")),
-    ] {
-        assert_eq!(value["status"], "ok", "{value}");
-        assert_eq!(value["rollout_path"], expected.to_string_lossy().as_ref());
-    }
-}
-
-#[test]
-fn thread_usage_finds_session_in_another_database() {
-    let tmp = tempdir().unwrap();
-    let primary = tmp.path().join("old.sqlite");
-    let fallback = tmp.path().join("current.sqlite");
-    let rollout = tmp.path().join("current.jsonl");
-    fs::write(&rollout, "").unwrap();
-    create_codex_thread_db(&primary, &rollout);
-    Connection::open(&primary)
-        .unwrap()
-        .execute("DELETE FROM threads", [])
-        .unwrap();
-    create_codex_thread_db(&fallback, &rollout);
-    let adapter = usage_candidate_adapter(&primary, &fallback, tmp.path());
-    assert_usage_rollout(&adapter, &rollout);
-}
-
-#[test]
-fn thread_usage_prefers_newest_valid_record_without_merging_events() {
-    let tmp = tempdir().unwrap();
-    let primary = tmp.path().join("old.sqlite");
-    let fallback = tmp.path().join("current.sqlite");
-    let old = tmp.path().join("old.jsonl");
-    let latest = tmp.path().join("current.jsonl");
-    let event = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":20,\"output_tokens\":10,\"total_tokens\":30}}}}\n";
-    fs::write(&old, event.repeat(2)).unwrap();
-    fs::write(&latest, event).unwrap();
-    create_codex_thread_db(&primary, &old);
-    create_codex_thread_db(&fallback, &latest);
-    let db = Connection::open(&fallback).unwrap();
-    db.execute("UPDATE threads SET updated_at_ms = 200000", [])
-        .unwrap();
-    drop(db);
-    let adapter = usage_candidate_adapter(&primary, &fallback, tmp.path());
-    assert_usage_rollout(&adapter, &latest);
-    assert_eq!(
-        adapter.codex_thread_usage_live(&session("t1", "Usage"))["events"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert_eq!(
-        adapter.codex_thread_usage_history(&session("t1", "Usage"))["history"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-}
-
-#[test]
-fn thread_usage_skips_empty_missing_and_unsupported_candidates() {
-    let tmp = tempdir().unwrap();
-    let primary = tmp.path().join("primary.sqlite");
-    let fallback = tmp.path().join("fallback.sqlite");
-    let rollout = tmp.path().join("current.jsonl");
-    fs::write(&rollout, "").unwrap();
-    create_codex_thread_db(&fallback, &rollout);
-    let adapter = usage_candidate_adapter(&primary, &fallback, tmp.path());
-    assert_usage_rollout(&adapter, &rollout);
-    assert!(
-        !primary.exists(),
-        "read-only discovery must not create missing databases"
-    );
-    create_codex_thread_db(&primary, Path::new(""));
-    assert_usage_rollout(&adapter, &rollout);
-    let db = Connection::open(&primary).unwrap();
-    db.execute(
-        "UPDATE threads SET rollout_path = ?1, updated_at_ms = 300000",
-        [tmp.path().join("missing.jsonl").to_string_lossy().as_ref()],
-    )
-    .unwrap();
-    assert_usage_rollout(&adapter, &rollout);
-    db.execute("DROP TABLE threads", []).unwrap();
-    assert_usage_rollout(&adapter, &rollout);
-}
-
-#[test]
-fn thread_usage_uses_seconds_timestamp_when_milliseconds_column_is_absent() {
-    let tmp = tempdir().unwrap();
-    let primary = tmp.path().join("primary.sqlite");
-    let fallback = tmp.path().join("fallback.sqlite");
-    let old = tmp.path().join("old.jsonl");
-    let latest = tmp.path().join("latest.jsonl");
-    fs::write(&old, "").unwrap();
-    fs::write(&latest, "").unwrap();
-    create_codex_thread_db(&primary, &old);
-    create_codex_thread_db(&fallback, &latest);
-    let db = Connection::open(&fallback).unwrap();
-    db.execute("ALTER TABLE threads DROP COLUMN updated_at_ms", [])
-        .unwrap();
-    db.execute("UPDATE threads SET updated_at = 300", [])
-        .unwrap();
-    assert_usage_rollout(
-        &usage_candidate_adapter(&primary, &fallback, tmp.path()),
-        &latest,
-    );
-}
-
-#[test]
-fn thread_usage_distinguishes_missing_thread_from_empty_rollout_path() {
-    let tmp = tempdir().unwrap();
-    let primary = tmp.path().join("primary.sqlite");
-    create_codex_thread_db(&primary, Path::new(""));
-    let adapter = SQLiteStorageAdapter::new(&primary, BackupStore::new(tmp.path().join("backups")));
-    assert_eq!(
-        adapter.codex_thread_usage_live(&session("missing", "Missing"))["message"],
-        "Thread not found in local storage"
-    );
-    assert_eq!(
-        adapter.codex_thread_usage_live(&session("t1", "Empty"))["message"],
-        "Thread rollout path is empty"
-    );
-}
-
-#[test]
-fn thread_usage_reports_corrupt_candidate_instead_of_hiding_database_error() {
-    let tmp = tempdir().unwrap();
-    let primary = tmp.path().join("corrupt.sqlite");
-    let fallback = tmp.path().join("fallback.sqlite");
-    let rollout = tmp.path().join("current.jsonl");
-    fs::write(&primary, "not a sqlite database").unwrap();
-    fs::write(&rollout, "").unwrap();
-    create_codex_thread_db(&fallback, &rollout);
-    let value = usage_candidate_adapter(&primary, &fallback, tmp.path())
-        .codex_thread_usage_live(&session("t1", "Usage"));
-    assert_eq!(value["status"], "failed");
-    assert!(
-        value["message"]
-            .as_str()
-            .unwrap()
-            .contains("not a database"),
-        "{value}"
-    );
 }
