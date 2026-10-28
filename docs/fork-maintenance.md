@@ -31,6 +31,12 @@
 - 官方 Codex 窗口的自动化读取被平台安全策略拒绝，因此本轮未截图验收实际状态栏，也未切换旧皮肤。官方用量候选库回归测试和前端状态栏生命周期测试通过；用户可在当前 Codex 会话确认实际读数。
 - 用量查询是 CDP bridge 路由，不是 helper 的裸 HTTP 路由；直接 POST `/thread-usage-live` 的 HTTP 404 不代表桥接接口故障。
 
+### v1.12.1：上游合并与 TPS 口径
+
+正式 Release 为 `v1.12.1`，从 v1.10.0 合并并保留个人去推广定制；官方用量实现继续使用上游版本。升级前恢复标签为 `local/pre-update-v1.12.1-20261028`。
+
+用量栏 TPS 使用同一 `turn_id` 内相邻 `token_count` 事件的会话累计输出差，除以事件时间差，取最近最多 3 个有效区间的算术平均，并四舍五入显示。只接受 0.5 至 120 秒的正增量区间；轮次标记缺失或只有一次调用时可能显示 `--`。该值包含两次事件间的工具执行、等待及生成时间，是日志估算的吞吐，不是模型纯解码速度，也不是按总耗时加权的整轮平均。
+
 ## 当前补丁与已退役补丁
 
 ### 用量：采用官方实现
@@ -112,7 +118,7 @@ macOS 本地实例遵循 v1.10.0 的固定 bundle 约定：`dist/local-build/Cod
 
 首次迁移可复制当前设置和运行快照到固定实例的 state 目录；原状态保留，后续不重复覆盖已有测试配置。涉及配置或数据库迁移时，先将相应状态单独备份，备份不入 Git。
 
-构建后，先备份固定 bundle 的旧二进制，退出对应旧管理进程，再用 `target/release/codex-plus-plus` 替换 `Contents/MacOS/CodexPlusPlus`；保留 Info.plist、LSEnvironment 和 state。升级版本时同步更新 bundle 版本字段。随后：
+构建后，先备份固定 bundle 的旧二进制，退出对应旧管理进程，再用 `target/release/codex-plus-plus` 替换 `Contents/MacOS/CodexPlusPlus`；保留 Info.plist、LSEnvironment 和 state。保持现有 Info.plist 不变；程序版本以应用“关于”页为准，Finder 的 bundle 版本字段可能仍显示旧值。随后：
 
 ```bash
 codesign --force --deep --sign - "dist/local-build/Codex++.app"
