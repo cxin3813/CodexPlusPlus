@@ -107,7 +107,9 @@ npm run vite:build
 cd ../..
 cargo test -p codex-plus-data
 cargo test -p codex-plus-core --lib assets::tests
-cargo test -p codex-plus-core --test ads --test cdp_bridge --test dream_skin
+cargo test -p codex-plus-core --test all ads::
+cargo test -p codex-plus-core --test all cdp_bridge::
+cargo test -p codex-plus-core --test all dream_skin::
 cargo build --release -p codex-plus-manager
 ```
 
