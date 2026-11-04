@@ -50,6 +50,13 @@
 - 固定 bundle 原先缺失，按仓库规则从 /Applications/Codex++.app 恢复后只替换二进制；保留其 Info.plist、LSEnvironment 和已有 state。
 - 回退标签 `local/pre-update-v2.1.4-20261031`，交付标签 `local/v2.1.4-no-promotions-20261031`；旧二进制、状态与配置备份在 `dist/upgrade-v2.1.4/`。官方 Codex 状态栏和其他新增功能没有逐项实测。
 
+### 2026-11-04：v2.2.0 合并候选，尚未交付
+
+- 上游稳定标签为 v2.2.0（2026-11-04 北京时间发布）。候选位于 `codex/update-v2.2.0`，保留官方新版首页、拓展体系和用量实现；移除首页推荐、供应商池推广提示及推广取数，并修正拓展可替换页面注册表。
+- TypeScript 检查、Vite 构建通过。数据模块测试在链接阶段被本机 Xcode 未接受许可协议阻塞，Rust 测试、Release 构建及新版启动验收尚未完成，因此不合入个人 main、不推送交付标签、不替换 Applications 中已验收的 v2.1.4。
+- 用户需自行打开 Xcode 完成许可和首次初始化，再继续 Rust 验证、构建及安装。验证日志在主检出目录的 `dist/upgrade-v2.2.0/`。
+- 正式安装版使用默认 `~/.codex-session-delete/`，不设置开发状态目录或开发 guard 端口，不迁移测试数据；固定开发 bundle 的隔离规则继续保留。
+
 ## 当前补丁与已退役补丁
 
 ### 用量：采用官方实现

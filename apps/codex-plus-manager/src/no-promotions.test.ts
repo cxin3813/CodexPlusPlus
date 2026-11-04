@@ -4,7 +4,7 @@ import { it } from "node:test";
 
 it("manager has no advertisement route, carousel, cards or loading action", async () => {
   const source = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
-  assert.doesNotMatch(source, /"recommendations"|SponsorBoard|RecommendationsScreen|AdGrid|refreshAds|load_ads/);
+  assert.doesNotMatch(source, /"recommendations"|SponsorBoard|RecommendationsScreen|AdGrid|refreshAds|load_ads|home-hero|home-sponsor|sponsorHintClosed/);
   assert.match(source, /function OverviewScreen\(/);
   assert.match(source, /id: "userScripts"/);
   assert.match(source, /id: "pluginMarket"/);
