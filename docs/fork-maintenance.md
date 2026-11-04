@@ -59,6 +59,13 @@
 - 旧正式 app 为 `dist/upgrade-v2.2.0/app-before-formal/Codex++.app`；正式状态备份为同目录 `state-before-formal/`，不含更新下载缓存和运行期 socket。开发实例也有独立 app、状态备份。配置和备份不入 Git。
 - 恢复源码标签 `local/pre-update-v2.2.0-20261104`，交付标签 `local/v2.2.0-no-promotions-20261104`。本轮未访问官方 Codex 窗口，未逐项验证其实际状态栏读数及其他新增功能；没有为验收重启用户正在使用的官方 Codex。
 
+### 2026-11-04：仅增强模式切换修复
+
+- 修复提交 `fc83b235`：模式切换只读取已保存的设置和版本号，通过 `load_settings(skipLocalProviderImport: true)` 跳过自动导入本机供应商；旧调用仍按原逻辑执行供应商初始化，不放宽供应商导入的凭据校验。读取失败或版本冲突时仍不提交模式。
+- 新增回归模拟缺少 API Key 的自动导入失败场景，验证模式切换成功、保留最新版本号和供应商快照；前端 1535 项通过、2 项跳过，类型检查、Vite 和 Release 构建通过。
+- 固定开发实例实际切换通过，已更新并启动 `/Applications/Codex++.app`。正式设置页显示「只用增强功能」，正式状态 `relayProfilesEnabled=false`，Codex 的 config.toml 和 auth.json 与操作前逐字节一致。正式目录仍为 `~/.codex-session-delete/`，旧 app 和状态备份在 `dist/fix-enhance-mode-20261104/`。
+- 本次不涉及核心 Rust 行为，沿用上一轮核心与数据测试证据；未重新执行整个 Rust workspace 测试。
+
 ## 当前补丁与已退役补丁
 
 ### 用量：采用官方实现
