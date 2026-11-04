@@ -3796,13 +3796,17 @@ pub async fn native_browser_status() -> NativeBrowserDiagnostics {
 }
 
 #[tauri::command]
-pub fn load_settings() -> CommandResult<SettingsPayload> {
+pub fn load_settings(skip_local_provider_import: Option<bool>) -> CommandResult<SettingsPayload> {
     let Ok(_guard) = relay_switch_mutex().lock() else {
         return failed(
             "供应商切换锁已损坏，请重启管理器后再试。",
             fallback_settings_payload(),
         );
     };
+    // 使用模式只需要已保存的设置；缺少供应商凭据不能阻塞关闭配置切换。
+    if skip_local_provider_import == Some(true) {
+        return settings_payload("设置已加载。", "设置读取失败");
+    }
     let store = SettingsStore::default();
     let home = codex_plus_core::relay_config::default_codex_home_dir();
     if let Err(error) =

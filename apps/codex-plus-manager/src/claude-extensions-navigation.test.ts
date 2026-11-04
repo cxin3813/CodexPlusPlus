@@ -650,3 +650,43 @@ test("后台设置变更事件同步 Claude 和 Computer Use 字段及 revision�
   cleanup();
   assert.equal(listeners.size, 0);
 });
+
+
+test("仅增强模式读取最新设置时跳过供应商导入，保留版本与供应商快照", async () => {
+  const source = declaration("closeAgentFocus").initializer!.getText(app);
+  const requests: Array<{ command: string; args: any }> = [];
+  const latest = { revision: "latest", relayProfilesEnabled: true, relayProfiles: [{ id: "external", configContents: "external identity" }] };
+  let committed: string | undefined;
+  const context = vm.createContext({
+    commitAgentFocusSelection: async (mode: string, actions: any) => {
+      if (!await actions.disableRelaySwitching()) return false;
+      actions.commit(mode);
+      return true;
+    },
+    run: async (operation: any) => operation(),
+    call: async (command: string, args: any) => {
+      requests.push({ command, args: structuredClone(args) });
+      if (command === "load_settings" && !args?.skipLocalProviderImport) return { status: "failed", message: "missing API key" };
+      return { status: "ok", settings: command === "save_settings" ? args.settings : latest };
+    },
+    isSuccessStatus: (status: string) => status === "ok",
+    normalizeSettings: (value: any) => value,
+    settingsRef: { current: { settings: latest } },
+    setSettings: () => {}, setSettingsForm: () => {},
+    agentFocus: "all", saveAgentFocus: (mode: string) => { committed = mode; },
+    setAgentFocusOpen: () => {}, setSetupOpen: () => {},
+    showNotice: () => assert.fail("不应报告读取或保存失败"),
+  });
+  vm.runInContext(transpile(`globalThis.select = ${source};`), context);
+  assert.equal(await context.select("enhance"), true);
+  assert.equal(committed, "enhance");
+  assert.deepEqual(requests, [
+    { command: "load_settings", args: { skipLocalProviderImport: true } },
+    { command: "save_settings", args: { settings: { ...latest, relayProfilesEnabled: false } } },
+  ]);
+  assert.equal(latest.relayProfilesEnabled, true);
+  const commands = readFileSync(new URL("../src-tauri/src/commands.rs", import.meta.url), "utf8");
+  const load = commands.slice(commands.indexOf("pub fn load_settings("), commands.indexOf("pub fn save_settings("));
+  assert.ok(load.indexOf("skip_local_provider_import == Some(true)") < load.indexOf("initialize_local_config_provider"));
+  assert.match(load, /return settings_payload\("设置已加载。", "设置读取失败"\);/);
+});

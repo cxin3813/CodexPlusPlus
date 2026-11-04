@@ -3404,7 +3404,7 @@ export function App() {
   const closeAgentFocus = (mode: FocusMode) => commitAgentFocusSelection(mode, {
     disableRelaySwitching: async () => {
       // 用最新版本关闭旧配置切换，失败时保留原模式和问卷，不提前隐藏管理入口。
-      const latest = await run(() => call<SettingsResult>("load_settings"));
+      const latest = await run(() => call<SettingsResult>("load_settings", { skipLocalProviderImport: true }));
       if (!latest || !isSuccessStatus(latest.status)) {
         if (latest) showNotice(t("设置读取失败"), latest.message, latest.status);
         return false;
