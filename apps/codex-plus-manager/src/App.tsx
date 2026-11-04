@@ -1392,9 +1392,9 @@ const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
  * 新增页面时**必须**想清楚归属：默认可见会让 Codex 专属功能在 Grok 下露出来。
  */
 const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string; tool?: string; tools?: readonly string[] }> = [
-  // 首页：整个程序的落脚页，专门放赞助商推荐（原「推荐内容」页并进来）。
+  // 首页：展示 Agent 状态与常用入口。
   { id: "home", get label() { return t("首页"); }, icon: House },
-  // 概览在两个工具下都可见：它承载共用的置顶推荐位，以及各自的状态。
+  // 概览在两个工具下都可见，展示各自的状态。
   { id: "overview", get label() { return t("概览"); }, icon: LayoutDashboard },
   // 「Codex 连接」：连接方式（经网关 / 直连）+ 直连供应商 + 高级；原「旧版供应商配置」「旧版代理设置」合成这一页。
   { id: "relay", get label() { return t("连接与供应商"); }, icon: Cable, tool: "codex" },
@@ -4180,7 +4180,6 @@ export function App() {
         void checkUpdate(true);
       }
       await refreshOverview(true);
-      // 启动落在首页，首页就是赞助商推荐，所以启动就拉一次。
       if (!handledNavigation) await refreshSettings(true);
       await refreshRelay(true);
       await refreshEnvConflicts(true);
@@ -16813,7 +16812,7 @@ function AppSidebar({
   }
 
   // 主模式的入口：每项对应一条路由，match 里的路由都算选中（用量的两个页签、MCP 与 Skills 的两个胶囊）。
-  // 第一组是首页（赞助商推荐）、万物皆拓展（Codex / Claude 下）、MCP 与 Skills、会话；第二组是聚合网关：一个 Agent 经网关同时用多家供应商。
+  // 第一组是首页、万物皆拓展（Codex / Claude 下）、MCP 与 Skills、会话；第二组是聚合网关：一个 Agent 经网关同时用多家供应商。
   type SideEntry = { key: string; route: Route; label: string; icon: LucideIcon; match: Route[]; tour?: string };
   // 万物皆拓展是独立入口，不随侧栏当前选的 Agent 显隐；宿主在页内切换。
   const extensionsShown = true;
@@ -17387,7 +17386,7 @@ function routeSubtitle(route: Route, soloAgent: string | null = null) {
   if (soloAgent && route === "hub") return tf("{0} 经 Codex++ 接入任意供应商：走哪家、是否健康，一屏看全", [agentName(soloAgent)]);
   if (soloAgent && route === "gateway") return tf("让 {0} 经 Codex++ 网关接入供应商池，并选它默认用的模型", [agentName(soloAgent)]);
   const subtitles: Record<Route, string> = {
-    home: t("赞助商推荐：支持 Codex++ 的服务"),
+    home: `${t("状态")} · ${t("常用")}`,
     overview: t("检查问题、启动与快速修复"),
     relay: t("管理 API 供应商、协议、Key 与配置文件"),
     multiLaunch: t("为不同供应商启动相互隔离的 Codex 实例"),
