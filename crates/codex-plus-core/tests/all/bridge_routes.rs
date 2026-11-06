@@ -16,6 +16,17 @@ use codex_plus_core::user_scripts::UserScriptManager;
 use serde_json::{Value, json};
 
 #[tokio::test]
+async fn thread_resume_metadata_requires_an_explicit_local_host_before_reading_storage() {
+    for payload in [json!({"thread_id":"a"}), json!({"thread_id":"a","host_id":"remote"}),
+        json!({"thread_id":"a","host_id":"local","hostId":"remote"})] {
+        let ctx = test_context();
+        let result = handle_bridge_request(ctx, "/thread-resume-model-metadata", payload).await;
+        assert_eq!(result["status"], "failed");
+        assert!(result["message"].as_str().unwrap().contains("local-only"));
+    }
+}
+
+#[tokio::test]
 async fn bridge_routes_cover_all_current_paths() {
     let ctx = test_context();
 
@@ -36,6 +47,7 @@ async fn bridge_routes_cover_all_current_paths() {
         ("/user-scripts/load", json!({})),
         ("/cdp/targets", json!({})),
         ("/cdp/evaluate", json!({"kind":"avatar-overlay","expression":"1"})),
+        ("/thread-goal/set-in-owner", json!({"params":{"objective":"goal"}})),
         ("/devtools/open", json!({})),
         ("/manager/open", json!({})),
         ("/manager/open-transient", json!({})),
@@ -118,6 +130,53 @@ async fn cdp_routes_are_wired_for_extensions() {
         "{}",
         result
     );
+}
+
+#[tokio::test]
+async fn thread_goal_route_preserves_payload_and_checks_the_live_enhancement_switch() {
+    let settings = Arc::new(FakeSettings::default());
+    let runtime = Arc::new(FakeRuntime::default());
+    let ctx = BridgeContext::new(settings.clone(), runtime.clone(), Arc::new(FakeData));
+    let payload = json!({
+        "hostId": "local", "threadId": "test-thread", "requestId": "goal-request",
+        "params": { "objective": "native goal", "appendTranscriptItem": false,
+            "threadSettings": { "model": "selected-model" } }
+    });
+    settings.settings.lock().unwrap().enhancements_enabled = false;
+    let disabled = handle_bridge_request(ctx.clone(), "/thread-goal/set-in-owner", payload.clone()).await;
+    assert_eq!(disabled["status"], "failed");
+    assert_eq!(disabled["code"], "goal-enhancements-disabled");
+    assert!(runtime.goal_payloads.lock().unwrap().is_empty());
+    settings.settings.lock().unwrap().enhancements_enabled = true;
+    let enabled = handle_bridge_request(ctx, "/thread-goal/set-in-owner", payload.clone()).await;
+    assert_eq!(enabled["status"], "ok");
+    assert_eq!(*runtime.goal_payloads.lock().unwrap(), vec![payload]);
+}
+
+#[tokio::test]
+async fn thread_goal_route_redacts_unexpected_errors_and_failed_values() {
+    let runtime = Arc::new(FakeRuntime::default());
+    let ctx = BridgeContext::new(
+        Arc::new(FakeSettings::default()), runtime.clone(), Arc::new(FakeData),
+    );
+    for reply in [
+        Err("Runtime.evaluate: secret-token at app://-/private.js with secret-stack".to_string()),
+        Ok(json!({
+            "status": "failed", "code": "private-error",
+            "message": "secret-token at app://-/private.js with secret-stack"
+        })),
+    ] {
+        *runtime.goal_reply.lock().unwrap() = Some(reply);
+        let response = handle_bridge_request(
+            ctx.clone(), "/thread-goal/set-in-owner", json!({"session_id":"secret-session"}),
+        ).await;
+        assert_eq!(response, json!({
+            "status": "failed", "code": "goal-forward-failed",
+            "message": "会话所在窗口暂不可用，请稍后重试设置目标"
+        }));
+        assert!(!response.to_string().contains("secret"));
+        assert!(!response.to_string().contains("app://"));
+    }
 }
 
 #[tokio::test]
@@ -1118,6 +1177,28 @@ async fn user_script_inventory_merges_renderer_runtime_status() {
     assert_eq!(failed["error"], "boom");
 }
 
+/// #2919：拓展包是文件夹，卸载时整个移进废纸篓（可找回），不做递归删除；配置里的记录一并去掉。
+#[test]
+fn deleting_an_extension_package_moves_the_folder_to_trash() {
+    let temp = tempfile::tempdir().unwrap();
+    let builtin_dir = temp.path().join("builtin");
+    let user_dir = temp.path().join("user");
+    let trash = temp.path().join("trash");
+    std::fs::create_dir_all(&builtin_dir).unwrap();
+    std::fs::create_dir_all(user_dir.join("my-pack")).unwrap();
+    std::fs::write(user_dir.join("my-pack").join("main.js"), "window.pack = true;").unwrap();
+    let manager = UserScriptManager::new(builtin_dir, user_dir.clone(), temp.path().join("user_scripts.json"));
+    manager.set_script_enabled("user:my-pack", true).unwrap();
+
+    let config = manager.delete_user_script_with_trash("user:my-pack", &trash).unwrap();
+
+    assert!(!user_dir.join("my-pack").exists(), "拓展包从用户目录里移走");
+    assert!(trash.join("my-pack").join("main.js").exists(), "整个文件夹在废纸篓里，可以找回");
+    assert!(!config.scripts.contains_key("user:my-pack"), "配置里的启用记录一并去掉");
+    // 不能借路径跳出用户目录。
+    assert!(manager.delete_user_script_with_trash("user:../builtin", &trash).is_err());
+}
+
 #[tokio::test]
 async fn user_script_manager_deletes_market_script_metadata_and_rejects_builtin_delete() {
     let temp = tempfile::tempdir().unwrap();
@@ -1662,6 +1743,8 @@ struct FakeRuntime {
     enabled: Mutex<bool>,
     script_enabled: Mutex<bool>,
     manager_payload: Mutex<Value>,
+    goal_payloads: Mutex<Vec<Value>>,
+    goal_reply: Mutex<Option<Result<Value, String>>>,
 }
 
 impl Default for FakeRuntime {
@@ -1670,12 +1753,22 @@ impl Default for FakeRuntime {
             enabled: Mutex::new(true),
             script_enabled: Mutex::new(true),
             manager_payload: Mutex::new(json!({})),
+            goal_payloads: Mutex::new(Vec::new()),
+            goal_reply: Mutex::new(None),
         }
     }
 }
 
 #[async_trait]
 impl BridgeRuntimeService for FakeRuntime {
+    async fn set_thread_goal_in_owner(&self, payload: Value) -> anyhow::Result<Value> {
+        self.goal_payloads.lock().unwrap().push(payload);
+        if let Some(reply) = self.goal_reply.lock().unwrap().take() {
+            return reply.map_err(anyhow::Error::msg);
+        }
+        Ok(json!({"status": "ok"}))
+    }
+
     async fn user_script_inventory(&self) -> anyhow::Result<Value> {
         Ok(self.inventory(false))
     }

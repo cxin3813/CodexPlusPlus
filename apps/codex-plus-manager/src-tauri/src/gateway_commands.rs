@@ -65,6 +65,10 @@ pub struct GatewayPoolEntry {
     pub key_concurrency: Option<u32>,
     /// 转发前移除托管生图工具（#228）。
     pub strip_image_generation_tool: bool,
+    /// 转发前移除 Responses 图片 `detail`（#2870）。
+    pub strip_responses_image_detail: bool,
+    /// 不向该上游发送 `tool_search` 托管工具（#2868）。
+    pub disable_tool_search: bool,
     /// 上次检查时上游有、列表里没有的模型（界面提示新模型）。
     pub upstream_new: Vec<String>,
     /// 上次检查时列表里有、上游已经没有的模型。
@@ -223,6 +227,8 @@ fn pool_entry(
         key_rpm: None,
         key_concurrency: None,
         strip_image_generation_tool: relay.strip_image_generation_tool,
+        strip_responses_image_detail: relay.strip_responses_image_detail,
+        disable_tool_search: relay.disable_tool_search,
         upstream_new: upstream.0,
         upstream_gone: upstream.1,
         quota: codex_plus_core::gateway::quota::get(&relay.id),
@@ -1551,6 +1557,8 @@ async fn import_opencode(id: &str, skip_agents: Option<&[String]>) -> anyhow::Re
         model_prices: None,
         proxy: None,
         strip_image_generation_tool: None,
+        strip_responses_image_detail: None,
+        disable_tool_search: None,
     };
     apply::create_provider(
         &GatewayStore::default(),
@@ -2102,9 +2110,28 @@ pub fn resume_agent_session(
     }
 }
 
+/// 最近一次打开的登录页地址：登录提示条上「复制登录链接」读它，方便用无痕窗口或别的浏览器打开（#2823）。
+static LAST_LOGIN_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginUrlPayload {
+    pub url: Option<String>,
+}
+
+/// 当前登录要打开的地址（没有进行中的浏览器登录时为空）。
+#[tauri::command]
+pub fn gateway_login_url() -> CommandResult<LoginUrlPayload> {
+    let url = LAST_LOGIN_URL.lock().map(|slot| slot.clone()).unwrap_or_default();
+    ok(if url.is_some() { "ok" } else { "没有进行中的浏览器登录。" }, LoginUrlPayload { url })
+}
+
 /// 用系统默认浏览器打开登录页。
 /// Windows 不能用 `cmd /c start`：授权地址里的 `&` 会被 cmd 当成命令分隔符，参数全丢。
 fn open_in_browser(url: &str) {
+    if let Ok(mut slot) = LAST_LOGIN_URL.lock() {
+        *slot = Some(url.to_string());
+    }
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
     #[cfg(target_os = "windows")]
@@ -2197,6 +2224,9 @@ fn login_response(outcome: LoginOutcome<String>) -> CommandResult<Option<Gateway
 #[tauri::command]
 pub fn cancel_gateway_login() -> CommandResult<()> {
     let cancelled = login_slot().take().map(|(_, abort)| abort()).is_some();
+    if let Ok(mut slot) = LAST_LOGIN_URL.lock() {
+        *slot = None;
+    }
     ok(
         if cancelled {
             LOGIN_CANCELLED

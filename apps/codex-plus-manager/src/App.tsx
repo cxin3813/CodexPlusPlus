@@ -116,6 +116,18 @@ import { isGitHubRepositoryHomepage } from "./github-repository";
 import { NativeBrowserStatusView, nativeBrowserConsent } from "./native-browser-settings";
 import { AgentCachePanel } from "./agent-cache";
 import { rebaseSettingsEdits } from "./settings-rebase";
+import {
+  contextEntriesByKind,
+  dedupeContextEntryList,
+  parseContextEntries,
+  selectedContextConfigToml,
+  setContextEntryEnabled,
+  splitContextConfigText,
+  stripContextEntriesFromConfig,
+  type CodexContextEntries,
+  type CodexContextEntry,
+  type ContextKind,
+} from "./context-config-text";
 import { summarizeRecentRequests, type RecentRequestSummary } from "./overview-model";
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
 import { DshPluginsPanel } from "./DshPluginsPanel";
@@ -150,7 +162,7 @@ import { hasCodexEnhancements, SETUP_STORAGE_KEY, serializeSetupState, shouldSho
 import { AgentFocusDialog } from "./AgentFocusDialog";
 import { AgentDisconnectDialog } from "./AgentDisconnectDialog";
 import { agentVisible, commitAgentFocusSelection, providersHidden, singleAgent, type AgentFocus, type FocusMode } from "./agent-focus-model";
-import { needAgentFocusPrompt, saveAgentFocus, useAgentFocus } from "./agent-focus-store";
+import { backupAgentFocus, needAgentFocusPrompt, restoreAgentFocusFromSettings, saveAgentFocus, useAgentFocus } from "./agent-focus-store";
 import { AgentDashboard, type DashboardAgent, type DashboardStat, type DashboardStatus } from "./AgentDashboard";
 import { TOUR_STORAGE_KEY, TOUR_VERSION } from "./onboarding-model";
 import "./ToolPages.css";
@@ -233,6 +245,8 @@ import {
   setIndependentProxyConfigured,
   requestCompatibilityEnabled,
   stripImageGenerationToolEnabled,
+  stripResponsesImageDetailEnabled,
+  pureApiImageGenerationEnabled,
   findRelayModelRouteIssue,
   modelRouteSaveRequiresRestart,
   normalizeRelayModelRoutes,
@@ -321,10 +335,13 @@ import {
   type ThemePreference,
 } from "./theme-mode";
 import {
+  multiLaunchInstanceCanRestart,
+  multiLaunchInstanceCanStop,
   multiLaunchInstanceFailure,
   multiLaunchInstanceLabel as formatMultiLaunchInstanceLabel,
   multiLaunchInstanceRunning,
   multiLaunchInstanceStatus,
+  multiLaunchInstanceVisible,
   runningInstancesForProfile,
   type MultiLaunchInstance,
 } from "./multi-launch-model";
@@ -335,8 +352,9 @@ import * as AgentCx from "./cx-layout"; // cx-pages:agents：Agent 页面在函�
 const isWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent);
 /// 增强设置项清单按平台过滤（例如桌宠跟随鼠标只在 Windows / macOS 显示）。
 const enhancementPlatform = enhancementPlatformFromUserAgent(navigator.userAgent);
-/// 会话维护页的「启动前自动修复历史会话」与 Codex 设置页共用清单里的同一条文案。
+/// 会话维护页的两条开关与 Codex 设置页共用清单里的文案（#2846 拆开后分别显示）。
 const providerSyncItem = enhancementItem("providerSyncEnabled");
+const sessionIndexRepairItem = enhancementItem("sessionIndexRepairEnabled");
 
 /// 多开启动后轮询「就绪/失败」结论的节奏：worker 最长等 90 秒就绪，这里给到 2 分钟。
 const MULTI_LAUNCH_POLL_INTERVAL_MS = 3000;
@@ -452,6 +470,10 @@ type BackendSettings = WhaleBalanceSettings & {
   codexExtraArgs: string[];
   dictation: DictationSettings;
   providerSyncEnabled: boolean;
+  /** 「启动前修复会话索引」与 providerSyncEnabled 分开（#2846）：只补投影、不改会话归属。 */
+  sessionIndexRepairEnabled?: boolean;
+  /** 使用模式在设置文件里的备份（#2902），本地存储丢了时用它补回。 */
+  managerAgentFocus?: string;
   threadModelFollowSwitchEnabled?: boolean;
   /** 启动时及运行期间自动检查 Codex++ 更新（#1272），默认开。 */
   updateAutoCheck?: boolean;
@@ -474,6 +496,7 @@ type BackendSettings = WhaleBalanceSettings & {
   codexAppSideChatSave: boolean;
   codexAppMarkdownExport: boolean;
   codexAppUsageStatusLine: boolean;
+  usageHistoryEnabled: boolean;
   codexAppProxyRequestStatus: boolean;
   codexAppPasteFix: boolean;
   codexAppForceChineseLocale: boolean;
@@ -488,6 +511,8 @@ type BackendSettings = WhaleBalanceSettings & {
   codexAppNativePredictions: boolean;
   /** 第三方模型回答完自动折叠过程（本地代理补阶段标记），默认关。 */
   codexAppThirdPartyReasoningCollapse: boolean;
+  /** 拿不到远程功能开关（国内网络）时补开「替我审批」入口（#2817），默认关。 */
+  codexAppOfflineAutoReview: boolean;
   /** 纯 API Key 模式启动 Codex 前把 Work 视图写回 Codex，避开 Work browser access 报错。 */
   codexAppDisableWorkView: boolean;
   codexAppPetRealMouseLook: boolean;
@@ -630,6 +655,12 @@ export type RelayProfile = {
   strictResponsesReasoning?: boolean;
   /** #228：转发前移除托管生图工具（image_generation），默认关闭。 */
   stripImageGenerationTool?: boolean;
+  /** #2870：转发前移除 Responses 图片 `detail`，默认关闭。 */
+  stripResponsesImageDetail?: boolean;
+  /** #2868：不向上游发送 tool_search，默认关闭。 */
+  disableToolSearch?: boolean;
+  /** #1433：纯 API 下让 Codex 注册原生生图工具，生图请求经本地代理发给本供应商，默认关闭。 */
+  pureApiImageGeneration?: boolean;
   /** Anthropic 上游的认证字段：`x-api-key`（默认）或 `authorization`。 */
   anthropicAuthHeader?: string;
   /** Anthropic 的 `max_tokens` 兜底值，0/缺省表示用内置 8192；填了则优先于请求值。 */
@@ -689,23 +720,6 @@ type RelayContextSelection = {
   mcpServers: string[];
   skills: string[];
   plugins: string[];
-};
-
-type ContextKind = "mcp" | "skill" | "plugin";
-
-type CodexContextEntry = {
-  id: string;
-  kind: ContextKind;
-  title: string;
-  summary: string;
-  tomlBody: string;
-  enabled: boolean;
-};
-
-type CodexContextEntries = {
-  mcpServers: CodexContextEntry[];
-  skills: CodexContextEntry[];
-  plugins: CodexContextEntry[];
 };
 
 type RelayProtocol = "responses" | "chatCompletions" | "anthropicMessages";
@@ -1399,7 +1413,8 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   // 「Codex 连接」：连接方式（经网关 / 直连）+ 直连供应商 + 高级；原「旧版供应商配置」「旧版代理设置」合成这一页。
   { id: "relay", get label() { return t("连接与供应商"); }, icon: Cable, tool: "codex" },
   { id: "multiLaunch", get label() { return t("多开"); }, icon: Layers3, tool: "codex" },
-  { id: "claude", get label() { return t("增强"); }, icon: Languages, tool: "claude" },
+  // 增强针对的是 Claude Desktop（汉化、Cowork 时限等），名字写明，免得和 Claude Code 命令行的概览混在一起（#2913）。
+  { id: "claude", get label() { return t("Desktop 增强"); }, icon: Languages, tool: "claude" },
   // 请求日志、会话、MCP、Skills 管理所有 Agent，不属于某一个 Agent。
   { id: "sessions", get label() { return t("会话"); }, icon: MessagesSquare },
   { id: "context", label: "MCP", icon: Network },
@@ -1524,6 +1539,7 @@ const defaultSettings: BackendSettings = {
   codexExtraArgs: [],
   dictation: defaultDictationSettings(),
   providerSyncEnabled: false,
+  sessionIndexRepairEnabled: true,
   threadModelFollowSwitchEnabled: false,
   updateAutoCheck: true,
   updateAutoDownload: true,
@@ -1543,6 +1559,7 @@ const defaultSettings: BackendSettings = {
   codexAppSideChatSave: false,
   codexAppMarkdownExport: true,
   codexAppUsageStatusLine: true,
+  usageHistoryEnabled: false,
   codexAppProxyRequestStatus: true,
   codexAppPasteFix: false,
   codexAppForceChineseLocale: false,
@@ -1555,6 +1572,7 @@ const defaultSettings: BackendSettings = {
   codexAppNativeFastUnlock: false,
   codexAppNativePredictions: false,
   codexAppThirdPartyReasoningCollapse: false,
+  codexAppOfflineAutoReview: false,
   codexAppDisableWorkView: false,
   codexAppPetRealMouseLook: false,
   codexAppActivityOverlayRight: false,
@@ -1733,6 +1751,18 @@ export function App() {
     setAgentFocusOpen(false);
     if (!agentFocus) setSetupOpen(false);
   }, [agentFocus]);
+  // 本地存储丢了使用模式、设置文件里还记着时补回来，问卷不再每次启动都弹（#2902）。
+  const settingsLoaded = Boolean(settings);
+  const savedAgentFocus = settings?.settings.managerAgentFocus;
+  useEffect(() => {
+    if (!settingsLoaded) return;
+    if (restoreAgentFocusFromSettings(savedAgentFocus)) {
+      setAgentFocusOpen(false);
+    } else if (!savedAgentFocus && agentFocus) {
+      // 升级前就选过模式的老用户：设置文件里还没有备份，补存一次。
+      backupAgentFocus(agentFocus);
+    }
+  }, [settingsLoaded, savedAgentFocus, agentFocus]);
   const closeSetup = (completed: boolean) => {
     try { window.localStorage.setItem(SETUP_STORAGE_KEY, serializeSetupState(completed ? "completed" : "dismissed")); } catch { /* 本次窗口内仍可关闭。 */ }
     setSetupOpen(false);
@@ -2087,7 +2117,11 @@ export function App() {
   const deleteUserScript = async (key: string) => {
     const script = settings?.user_scripts?.scripts?.find((item) => item.key === key);
     const name = script?.name || key;
-    if (!(await appConfirm(tf("删除脚本“{0}”？此操作会移除本地脚本文件。", [name]), { title: t("删除脚本"), confirmText: t("删除"), danger: true }))) return;
+    const isPackage = script?.kind === "package";
+    const question = isPackage
+      ? tf("卸载拓展“{0}”？整个拓展文件夹会移进废纸篓，需要时可以从废纸篓找回。", [name])
+      : tf("删除脚本“{0}”？此操作会移除本地脚本文件。", [name]);
+    if (!(await appConfirm(question, { title: isPackage ? t("卸载拓展") : t("删除脚本"), confirmText: isPackage ? t("卸载") : t("删除"), danger: true }))) return;
     const result = await run(() => call<SettingsResult>("delete_user_script", { key }));
     if (result) {
       setSettings(result);
@@ -2979,7 +3013,7 @@ export function App() {
         // 界面要给出「启动失败 + 原因」，只留运行中的会让它彻底消失。
         setMultiLaunchInstances(
           Array.isArray(result.instances)
-            ? result.instances.filter((instance) => multiLaunchInstanceRunning(instance) || Boolean(multiLaunchInstanceFailure(instance)))
+            ? result.instances.filter(multiLaunchInstanceVisible)
             : [],
         );
         if (!silent && !isSuccessStatus(result.status)) showNotice(t("当前运行实例"), result.message, result.status);
@@ -8162,6 +8196,7 @@ function CodexMultiLaunchScreen({
           {instances.length ? instances.map((instance) => {
             const status = multiLaunchInstanceStatus(instance);
             const running = multiLaunchInstanceRunning(instance);
+            const canStop = multiLaunchInstanceCanStop(instance);
             const pending = actions.multiLaunchActionPending === instance.instanceId;
             const label = formatMultiLaunchInstanceLabel(instance, { main: t("主 Codex"), fallback: t("Codex 实例") });
             // 启动失败的原因必须让用户看得见：Windows 上多开曾经完全不吭声。
@@ -8171,7 +8206,7 @@ function CodexMultiLaunchScreen({
               typeof instance.pid === "number" ? `PID ${instance.pid}` : "",
               typeof instance.debugPort === "number" ? `CDP ${instance.debugPort}` : "",
               typeof instance.helperPort === "number" ? `API ${instance.helperPort}` : "",
-              failure ? `${t("启动失败")}：${failure}` : "",
+              failure ? `${instance.launchResult?.status === "cleanup_failed" ? t("失败") : t("启动失败")}：${failure}` : "",
             ].filter(Boolean).join(" · ");
             const tone = statusClass(status);
             return (
@@ -8184,7 +8219,7 @@ function CodexMultiLaunchScreen({
                 >
                   <button
                     className="cx-secondary"
-                    disabled={pending}
+                    disabled={!multiLaunchInstanceCanRestart(instance) || pending}
                     onClick={() => void actions.restartMultiLaunchInstance(instance)}
                     title={t("重启此 Codex 实例；修改供应商或 Key 后重启才会生效")}
                     type="button"
@@ -8196,9 +8231,9 @@ function CodexMultiLaunchScreen({
                   <button
                     aria-label={t("结束此 Codex 实例")}
                     className="cx-secondary"
-                    disabled={!running || pending}
+                    disabled={!canStop || pending}
                     onClick={() => void actions.stopMultiLaunchInstance(instance)}
-                    title={running ? t("结束此 Codex 实例") : t("实例当前未运行")}
+                    title={canStop ? t("结束此 Codex 实例") : t("实例当前未运行")}
                     type="button"
                   >
                     <PowerOff />
@@ -10566,8 +10601,8 @@ function SessionRepairPanel({ dirty, form, providerSyncProgress, sessionIndexRep
     <summary className="session-maintenance-summary">
       <Wrench aria-hidden="true" className="h-4 w-4" />
       <strong>{t("修复与维护")}</strong>
-      <span className="session-maintenance-auto-state" data-enabled={form.providerSyncEnabled}>
-        {form.providerSyncEnabled ? t("自动修复已开启") : t("自动修复已关闭")}
+      <span className="session-maintenance-auto-state" data-enabled={form.sessionIndexRepairEnabled ?? true}>
+        {(form.sessionIndexRepairEnabled ?? true) ? t("自动修复已开启") : t("自动修复已关闭")}
       </span>
       <span className="session-maintenance-status" data-error={maintenanceHasError} role="status" aria-live="polite">
         {providerSyncProgress.active
@@ -10581,6 +10616,17 @@ function SessionRepairPanel({ dirty, form, providerSyncProgress, sessionIndexRep
     <div className="session-maintenance-content">
           {/* 和设置页同一种行：左边标题 + 一行说明，右边控件；开关即改即存（SettingsAutoSave）。 */}
           <div className="session-repair-rows">
+            <SettingRow title={t(sessionIndexRepairItem.title)} description={t(sessionIndexRepairItem.description)}>
+              <label className="relay-bare-switch">
+                <input
+                  aria-label={t(sessionIndexRepairItem.title)}
+                  checked={form.sessionIndexRepairEnabled ?? true}
+                  onChange={(event) => onFormChange({ ...form, sessionIndexRepairEnabled: event.currentTarget.checked })}
+                  type="checkbox"
+                />
+                <ToggleVisual />
+              </label>
+            </SettingRow>
             <SettingRow title={t(providerSyncItem.title)} description={t(providerSyncItem.description)}>
               <label className="relay-bare-switch">
                 <input
@@ -11416,6 +11462,15 @@ function AgentSettingsScreen({
   return (
     <>
       <TopbarActions><SettingsAutoSave className="cx-set-autosave" dirty={dirty} form={form} actions={actions} /></TopbarActions>
+      <CxSection id="codex-settings-usage-history" title={t("本机用量历史")}>
+        <CxRow title={t("启用本机用量历史")} detail={t("允许扩展按需读取本机用量元数据，默认关闭。")}>
+          <Switch
+            label={t("启用本机用量历史")}
+            on={form.usageHistoryEnabled}
+            onToggle={() => onFormChange({ ...form, usageHistoryEnabled: !form.usageHistoryEnabled })}
+          />
+        </CxRow>
+      </CxSection>
       {/* 放在「高级」卡片里，默认收起；填了参数时标题旁显示条数，不用展开也知道有没有设。 */}
       <details className="cx-set-disclosure cx-set-disclosure-first" open={count > 0 || undefined}>
         <summary>
@@ -12496,6 +12551,9 @@ function RelayProfileEditor({
     profile.trustUpstreamCatalogLite === true,
     profile.strictResponsesReasoning === true,
     profile.stripImageGenerationTool === true,
+    profile.stripResponsesImageDetail === true,
+    profile.disableToolSearch === true,
+    profile.pureApiImageGeneration === true,
   ].filter(Boolean).length;
   const [stabilizePromptPrefixBusy, setStabilizePromptPrefixBusy] = useState(false);
   const useCommonConfig = profile.useCommonConfig !== false;
@@ -14082,7 +14140,21 @@ function RelayProfileEditor({
                     <input type="checkbox" checked={profile.stripImageGenerationTool === true} onChange={(event) => updateDraft({ stripImageGenerationTool: event.currentTarget.checked })} />
                     <span><strong>{t("移除请求里的托管生图工具（image_generation）")}</strong><small>{t("Codex App 每次请求都会带上托管生图工具，不支持生图的中转会整条请求返回 403 或报错。开启后转发前从 tools 里去掉它（及指向它的 tool_choice），请求改走本地代理；Codex 里将无法调用内置生图。默认关闭。")}</small></span><ToggleVisual />
                   </label>
+                  <label className="switch-row compact relay-switch-row relay-field-strip-responses-image-detail">
+                    <input type="checkbox" checked={profile.stripResponsesImageDetail === true} onChange={(event) => updateDraft({ stripResponsesImageDetail: event.currentTarget.checked })} />
+                    <span><strong>{t("移除 Responses 图片 detail 字段")}</strong><small>{t("部分 Responses 上游不认 OpenAI 的 input_image.detail，只会返回泛化的参数错误。开启后转发前从普通消息和工具输出里的图片块删除 detail，请求改走本地代理。默认关闭。")}</small></span><ToggleVisual />
+                  </label>
+                  <label className="switch-row compact relay-switch-row relay-field-disable-tool-search">
+                    <input type="checkbox" checked={profile.disableToolSearch === true} onChange={(event) => updateDraft({ disableToolSearch: event.currentTarget.checked })} />
+                    <span><strong>{t("不发送 tool_search（上游不支持时开启）")}</strong><small>{t("部分第三方 Responses 上游不认 Codex 的托管工具 tool_search，供应商测试能通过，但实际聊天会返回 400（tool type \"tool_search\" is not supported）。开启后模型目录关闭 supports_search_tool，Codex 改为直接列出 MCP 工具。Kimi 官方地址会自动处理。重启 Codex 后生效。默认关闭。")}</small></span><ToggleVisual />
+                  </label>
                 </> : null}
+                {showApiFields && profile.relayMode === "pureApi" ? (
+                  <label className="switch-row compact relay-switch-row relay-field-pure-api-image-generation">
+                    <input type="checkbox" checked={profile.pureApiImageGeneration === true} onChange={(event) => updateDraft({ pureApiImageGeneration: event.currentTarget.checked })} />
+                    <span><strong>{t("纯 API 启用 Codex 原生生图（实验）")}</strong><small>{t("Codex 默认只在登录 ChatGPT 时注册 image_gen 工具。开启后 Codex++ 在 config.toml 里写入占位请求头让 Codex 注册该工具，生图请求经本地代理发给本供应商的 /images/generations、/images/edits，占位头不会发往上游。上游需支持 OpenAI 图片接口；依赖 Codex 内部判据，Codex 更新后可能失效。默认关闭。")}</small></span><ToggleVisual />
+                  </label>
+                ) : null}
                 </div>
               </details>
             ) : null}
@@ -16725,6 +16797,8 @@ function AppSidebar({
 }) {
   const gateway = useGatewayPayload(10_000);
   const [settingsQuery, setSettingsQuery] = useState("");
+  // 收起了页面列表的 Agent：再点一次当前 Agent 收起 / 展开它下面的页面（#2913）。切到别的 Agent 时清掉。
+  const [collapsedAgent, setCollapsedAgent] = useState<string | null>(null);
   const enhanceOnly = providersHidden(focus);
   const settingsMode = settingsModeRoutes.has(route);
   const onGlobalPage = globalNavigationRoutes.includes(route);
@@ -16906,6 +16980,9 @@ function AppSidebar({
           {/* 每个 Agent 一行；点一下切到它，回到上次看的页面（没有就是落脚页）。它的页面在内容区顶部的胶囊里。 */}
           {tools.map((tool) => {
             const current = tool.id === activeTool && !onGlobalPage;
+            const expanded = current && collapsedAgent !== tool.id;
+            // 这一行同时管 Claude Code（命令行配置概览）和 Claude Desktop（增强），侧栏只写 Claude，免得误以为增强针对的是命令行（#2913）。
+            const displayName = tool.id === "claude" ? "Claude" : tool.name;
             const title = tool.switchable
               ? tf("{0}｜{1}｜{2} 个供应商", [tool.name, tool.homeDir || t("未配置目录"), tool.relayCount])
               : tf("{0}｜{1}｜供应商配置尚未接入", [tool.name, tool.homeDir || t("未配置目录")]);
@@ -16920,15 +16997,24 @@ function AppSidebar({
               <div className={`cx-side-agent ${tool.id === "codex" && tool.switchable ? "has-run" : ""}`.trim()}>
                 <button
                   aria-current={current ? "true" : undefined}
-                  aria-label={tool.switchable ? `${tool.name} · ${access.label}` : `${tool.name} · ${t("待接入")}`}
-                  className={`cx-side-item ${current ? "active" : ""} ${current && agentTabGroups(navigationSections, routeTool, tool.id).flatMap((entry) => visibleRoutes(focus, entry.routes)).length > 1 ? "has-subnav" : ""}`.trim()}
+                  aria-expanded={current ? expanded : undefined}
+                  aria-label={tool.switchable ? `${displayName} · ${access.label}` : `${displayName} · ${t("待接入")}`}
+                  className={`cx-side-item ${current ? "active" : ""} ${expanded && agentTabGroups(navigationSections, routeTool, tool.id).flatMap((entry) => visibleRoutes(focus, entry.routes)).length > 1 ? "has-subnav" : ""}`.trim()}
                   disabled={!tool.switchable}
-                  onClick={() => onOpenAgent(tool.id)}
+                  onClick={() => {
+                    // 再点当前 Agent：只收起 / 展开它的页面列表，不跳页；点别的 Agent 照常切过去并展开。
+                    if (current) {
+                      setCollapsedAgent((value) => (value === tool.id ? null : tool.id));
+                      return;
+                    }
+                    setCollapsedAgent(null);
+                    onOpenAgent(tool.id);
+                  }}
                   title={`${title}｜${access.label}`}
                   type="button"
                 >
                   <AgentGlyph agent={tool.id} className="cx-side-icon" />
-                  <span className="cx-side-label">{tool.name}</span>
+                  <span className="cx-side-label">{displayName}</span>
                   {enhanceOnly ? null : <i aria-hidden="true" className="side-dot" data-tone={access.tone} />}
                 </button>
                 {tool.id === "codex" && tool.switchable ? (() => {
@@ -16953,7 +17039,7 @@ function AppSidebar({
                 })() : null}
               </div>
               {/* 当前 Agent 的页面：缩进列在它那一行下面（参照 Cursor 侧栏里仓库下面的会话列表），不再占内容区顶部一排胶囊。 */}
-{current ? (() => {
+{expanded ? (() => {
             const pages = agentTabGroups(navigationSections, routeTool, activeTool)
               .flatMap((entry) => visibleRoutes(focus, entry.routes));
             if (pages.length < 2) return null;
@@ -17224,8 +17310,8 @@ function ScriptRow({ host, script, globalEnabled, actions }: { host: ExtensionHo
     : isPackage
       ? tf("拓展包 · {0}", [script.package?.version || t("未知版本")])
       : script.source === "builtin" ? t("内置") : t("用户");
-  // 拓展包是文件夹，后端只删单文件，这里不给删除按钮。
-  const canDelete = codexHost && script.source === "user" && !isPackage;
+  // 拓展包是文件夹：后端整个移进废纸篓（可找回，#2919），单文件脚本直接删除。
+  const canDelete = codexHost && script.source === "user";
   const state = extensionStateForHost(script, host, globalEnabled);
   const { label, hint } = localScriptStateLabel(state, host);
   const stateHint = codexHost && state === "failed" && script.error ? `${hint}\n${script.error}` : hint;
@@ -17474,14 +17560,6 @@ function contextEntriesForProfile(settings: BackendSettings, profile: RelayProfi
   return filterContextEntriesBySelection(contextEntriesFromSettings(settings), profile.contextSelection);
 }
 
-function contextEntriesFromConfig(configContents: string): CodexContextEntries {
-  return {
-    mcpServers: parseContextEntries(configContents, "mcp", "mcp_servers"),
-    skills: parseContextEntries(configContents, "skill", "skills"),
-    plugins: parseContextEntries(configContents, "plugin", "plugins"),
-  };
-}
-
 function mergeContextEntries(primary: CodexContextEntries, secondary: CodexContextEntries): CodexContextEntries {
   return {
     mcpServers: mergeContextEntryList(primary.mcpServers, secondary.mcpServers),
@@ -17494,146 +17572,8 @@ function mergeContextEntryList(primary: CodexContextEntry[], secondary: CodexCon
   return dedupeContextEntryList([...primary, ...secondary]);
 }
 
-function dedupeContextEntryList(entries: CodexContextEntry[]): CodexContextEntry[] {
-  const byId = new Map<string, CodexContextEntry>();
-  for (const entry of entries) {
-    byId.set(entry.id, entry);
-  }
-  return Array.from(byId.values());
-}
-
-function parseContextEntries(commonConfig: string, kind: ContextKind, tableName: string): CodexContextEntry[] {
-  const anyHeaderPattern = /^\s*\[[^\]]+\]\s*$/;
-  const entries = new Map<string, CodexContextEntry>();
-  let currentId: string | null = null;
-  let body: string[] = [];
-
-  const flush = () => {
-    if (!currentId) return;
-    const tomlBody = ensureTrailingNewline(body.join("\n").trimEnd());
-    entries.set(currentId, {
-      id: currentId,
-      kind,
-      title: currentId,
-      summary: contextEntrySummary(tomlBody),
-      tomlBody,
-      enabled: contextEntryEnabled(tomlBody),
-    });
-  };
-
-  for (const line of commonConfig.split(/\r?\n/)) {
-    const path = tomlTablePathFromLine(line);
-    if (path?.[0] === tableName && path.length >= 2) {
-      const id = path[1];
-      if (currentId === id && path.length > 2) {
-        body.push(`[${path.slice(2).map(tomlKey).join(".")}]`);
-        continue;
-      }
-      flush();
-      currentId = id;
-      body = [];
-      continue;
-    }
-    if (currentId && anyHeaderPattern.test(line)) {
-      flush();
-      currentId = null;
-      body = [];
-      continue;
-    }
-    if (currentId) body.push(line);
-  }
-  flush();
-
-  return Array.from(entries.values());
-}
-
-function tomlTablePathFromLine(line: string): string[] | null {
-  const match = /^\s*\[([^\]]+)\]\s*$/.exec(line);
-  if (!match) return null;
-  return parseTomlDottedPath(match[1].trim());
-}
-
-function parseTomlDottedPath(path: string): string[] | null {
-  const parts: string[] = [];
-  let current = "";
-  let quote: '"' | "'" | null = null;
-  let escaping = false;
-
-  for (const char of path) {
-    if (quote) {
-      if (quote === '"' && escaping) {
-        current += char;
-        escaping = false;
-      } else if (quote === '"' && char === "\\") {
-        escaping = true;
-      } else if (char === quote) {
-        quote = null;
-      } else {
-        current += char;
-      }
-      continue;
-    }
-
-    if (char === '"' || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (char === ".") {
-      if (!current.trim()) return null;
-      parts.push(current.trim());
-      current = "";
-      continue;
-    }
-    current += char;
-  }
-
-  if (quote || escaping || !current.trim()) return null;
-  parts.push(current.trim());
-  return parts;
-}
-
-function contextEntrySummary(tomlBody: string) {
-  return tomlBody
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => line && !line.startsWith("#") && !/^enabled\s*=/.test(line))
-    ?.slice(0, 96) ?? "";
-}
-
-function contextEntryEnabled(tomlBody: string) {
-  return !tomlBody.split(/\r?\n/).some((line) => /^\s*enabled\s*=\s*false\s*(#.*)?$/i.test(line));
-}
-
-function setContextEntryEnabled(tomlBody: string, enabled: boolean) {
-  const lines = tomlBody.trimEnd().split(/\r?\n/);
-  const nextValue = `enabled = ${enabled ? "true" : "false"}`;
-  let replaced = false;
-  const next = lines.map((line) => {
-    if (/^\s*enabled\s*=/.test(line)) {
-      replaced = true;
-      return nextValue;
-    }
-    return line;
-  });
-  if (!replaced) next.unshift(nextValue);
-  return ensureTrailingNewline(next.join("\n").trimEnd());
-}
-
 function ensureTrailingNewline(value: string) {
   return value.trim() ? `${value}\n` : "";
-}
-
-function unquoteTomlKey(key: string) {
-  if (key.length >= 2 && ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'")))) {
-    return key.slice(1, -1);
-  }
-  return key;
-}
-
-function contextEntriesByKind(entries: CodexContextEntries, kind: ContextKind): CodexContextEntry[] {
-  if (kind === "mcp") return dedupeContextEntryList(entries.mcpServers);
-  if (kind === "skill") return dedupeContextEntryList(entries.skills);
-  return dedupeContextEntryList(entries.plugins);
 }
 
 function filterContextEntriesBySelection(entries: CodexContextEntries, selection: RelayContextSelection): CodexContextEntries {
@@ -17705,45 +17645,6 @@ function tomlAssignmentKeys(contents: string): string[] {
   return contents.split(/\r?\n/).map(tomlAssignmentKey).filter((key): key is string => Boolean(key));
 }
 
-function selectedContextConfigToml(entries: CodexContextEntries): string {
-  const sections: string[] = [];
-  for (const option of contextKindOptions) {
-    for (const entry of dedupeContextEntryList(contextEntriesByKind(entries, option.kind))) {
-      if (!entry.enabled) continue;
-      sections.push(contextEntryToTomlSection(option.tableName, entry));
-    }
-  }
-  return ensureTrailingNewline(sections.join("\n\n"));
-}
-
-function allContextConfigToml(entries: CodexContextEntries): string {
-  const sections: string[] = [];
-  for (const option of contextKindOptions) {
-    for (const entry of dedupeContextEntryList(contextEntriesByKind(entries, option.kind))) {
-      sections.push(contextEntryToTomlSection(option.tableName, entry));
-    }
-  }
-  return ensureTrailingNewline(sections.join("\n\n"));
-}
-
-function contextEntryToTomlSection(tableName: string, entry: CodexContextEntry): string {
-  const parentHeader = `[${tableName}.${tomlKey(entry.id)}]`;
-  const body = entry.tomlBody
-    .trimEnd()
-    .split(/\r?\n/)
-    .map((line) => relativeContextSubtableToAbsolute(line, tableName, entry.id))
-    .join("\n");
-  return `${parentHeader}\n${body}`;
-}
-
-function relativeContextSubtableToAbsolute(line: string, tableName: string, id: string): string {
-  const match = /^\s*\[([^\]]+)\]\s*$/.exec(line);
-  if (!match) return line;
-  const subtable = match[1].trim();
-  if (!subtable || subtable.includes(".")) return line;
-  return `[${tableName}.${tomlKey(id)}.${tomlKey(subtable)}]`;
-}
-
 function syncLiveConfigContextState(liveConfigContents: string, settings: BackendSettings): string {
   const entries = contextEntriesFromSettings(settings);
   const withoutManaged = stripContextEntriesFromConfig(liveConfigContents, entries);
@@ -17752,37 +17653,6 @@ function syncLiveConfigContextState(liveConfigContents: string, settings: Backen
 
 function relayCombinedCommonConfig(settings: BackendSettings): string {
   return joinTomlSectionsRootFirst([settings.relayCommonConfigContents || "", settings.relayContextConfigContents || ""]);
-}
-
-function splitContextConfigText(configContents: string): { common: string; context: string } {
-  const entries = contextEntriesFromConfig(configContents);
-  return {
-    common: stripContextEntriesFromConfig(configContents, entries),
-    context: allContextConfigToml(entries),
-  };
-}
-
-function stripContextEntriesFromConfig(configContents: string, entries: CodexContextEntries): string {
-  const knownIds: Record<ContextKind, Set<string>> = {
-    mcp: new Set(entries.mcpServers.map((entry) => entry.id)),
-    skill: new Set(entries.skills.map((entry) => entry.id)),
-    plugin: new Set(entries.plugins.map((entry) => entry.id)),
-  };
-  const lines = configContents.split(/\r?\n/);
-  const kept: string[] = [];
-  let skipping = false;
-
-  for (const line of lines) {
-    const contextHeader = contextHeaderFromLine(line);
-    if (contextHeader) {
-      skipping = knownIds[contextHeader.kind].has(contextHeader.id);
-    } else if (/^\s*\[[^\]]+\]\s*$/.test(line)) {
-      skipping = false;
-    }
-    if (!skipping) kept.push(line);
-  }
-
-  return ensureTrailingNewline(kept.join("\n").trimEnd());
 }
 
 function stripCommonConfigTextFallback(configContents: string, commonConfig: string): string {
@@ -17834,13 +17704,6 @@ function tomlRootKeyFromLine(line: string): string | null {
   if (index < 0) return null;
   const key = line.slice(0, index).trim();
   return key || null;
-}
-
-function contextHeaderFromLine(line: string): { kind: ContextKind; id: string } | null {
-  const path = tomlTablePathFromLine(line);
-  if (!path || path.length !== 2) return null;
-  const option = contextKindOptions.find((item) => item.tableName === path[0]);
-  return option ? { kind: option.kind, id: path[1] } : null;
 }
 
 function applyContextLimitPreview(configContents: string, profile: RelayProfile): string {
@@ -17956,10 +17819,6 @@ function splitTomlRootAndTables(section: string): { root: string; tables: string
     root: lines.slice(0, firstTable).join("\n"),
     tables: lines.slice(firstTable).join("\n"),
   };
-}
-
-function tomlKey(key: string): string {
-  return /^[A-Za-z0-9_-]+$/.test(key) ? key : `"${tomlString(key)}"`;
 }
 
 function contextSelectionIds(selection: RelayContextSelection, kind: ContextKind): string[] {
@@ -18185,6 +18044,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
   return syncLegacyRelayFields({
     ...defaultSettings,
     ...settings,
+    usageHistoryEnabled: settings.usageHistoryEnabled === true,
     ...normalizeWhaleBalanceSettings(settings),
     ccsDbPath: (settings.ccsDbPath || "").trim(),
     weixinConnectReasoningEffort: (settings.weixinConnectReasoningEffort || "").trim(),
@@ -18356,6 +18216,9 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     trustUpstreamCatalogLite: profile.trustUpstreamCatalogLite === true,
     strictResponsesReasoning: profile.strictResponsesReasoning === true,
     stripImageGenerationTool: profile.stripImageGenerationTool === true,
+    stripResponsesImageDetail: profile.stripResponsesImageDetail === true,
+    disableToolSearch: profile.disableToolSearch === true,
+    pureApiImageGeneration: profile.pureApiImageGeneration === true,
     anthropicAuthHeader: normalizeAnthropicAuthHeader(profile.anthropicAuthHeader),
     anthropicMaxTokens: normalizeAnthropicMaxTokens(profile.anthropicMaxTokens),
     anthropicPromptCache: profile.anthropicPromptCache !== false,
@@ -18631,7 +18494,7 @@ function withGeneratedRelayFiles(profile: RelayProfile): RelayProfile {
 }
 
 function buildRelayConfigToml(
-  profile: Pick<RelayProfile, "id" | "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider" | "relayMode" | "officialMixApiKey" | "webSearchHistoryCompat" | "localCompactionPromptAtEnd" | "strictResponsesReasoning" | "stripImageGenerationTool" | "modelMetadata">,
+  profile: Pick<RelayProfile, "id" | "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider" | "relayMode" | "officialMixApiKey" | "webSearchHistoryCompat" | "localCompactionPromptAtEnd" | "strictResponsesReasoning" | "stripImageGenerationTool" | "stripResponsesImageDetail" | "pureApiImageGeneration" | "modelMetadata">,
   options: { includeBearerToken: boolean; requiresOpenAiAuth?: boolean },
 ): string {
   const searchHistoryCompat = profile.webSearchHistoryCompat === true
@@ -18642,7 +18505,7 @@ function buildRelayConfigToml(
     && (profile.protocol === "responses" || profile.protocol === "chatCompletions")
     && profile.relayMode !== "aggregate"
     && (profile.relayMode !== "official" || profile.officialMixApiKey);
-  const baseUrl = profile.protocol !== "responses" || independentProxyEnabled(profile) || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(profile) || stripImageGenerationToolEnabled(profile)
+  const baseUrl = profile.protocol !== "responses" || independentProxyEnabled(profile) || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(profile) || stripImageGenerationToolEnabled(profile) || stripResponsesImageDetailEnabled(profile) || pureApiImageGenerationEnabled(profile)
     ? PROTOCOL_PROXY_BASE_URL
     : profile.baseUrl.trim();
   const apiKey = profile.apiKey.trim();
@@ -18793,7 +18656,7 @@ function applyRelayProfilePatchToFiles(
   if ("upstreamBaseUrl" in patch) {
     next.baseUrl = patch.upstreamBaseUrl || "";
   }
-  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "webSearchHistoryCompat" in patch || "localCompactionPromptAtEnd" in patch || "strictResponsesReasoning" in patch || "stripImageGenerationTool" in patch || "modelMetadata" in patch) {
+  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "webSearchHistoryCompat" in patch || "localCompactionPromptAtEnd" in patch || "strictResponsesReasoning" in patch || "stripImageGenerationTool" in patch || "stripResponsesImageDetail" in patch || "pureApiImageGeneration" in patch || "modelMetadata" in patch) {
     const searchHistoryCompat = next.webSearchHistoryCompat === true
       && next.protocol === "responses"
       && next.relayMode !== "aggregate"
@@ -18802,7 +18665,7 @@ function applyRelayProfilePatchToFiles(
       && (next.protocol === "responses" || next.protocol === "chatCompletions")
       && next.relayMode !== "aggregate"
       && (next.relayMode !== "official" || next.officialMixApiKey);
-    const baseUrlForConfig = next.protocol !== "responses" || independentProxyEnabled(next) || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(next) || stripImageGenerationToolEnabled(next)
+    const baseUrlForConfig = next.protocol !== "responses" || independentProxyEnabled(next) || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(next) || stripImageGenerationToolEnabled(next) || stripResponsesImageDetailEnabled(next) || pureApiImageGenerationEnabled(next)
       ? PROTOCOL_PROXY_BASE_URL
       : next.upstreamBaseUrl || next.baseUrl;
     next.configContents = setCodexProviderStringKey(next.configContents, "base_url", baseUrlForConfig, {
