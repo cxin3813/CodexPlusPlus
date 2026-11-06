@@ -72,7 +72,7 @@
 - 前端 1648 项通过、2 项跳过；类型检查、Vite 构建通过；数据模块 503 项通过、2 项忽略；相关核心回归 227 项通过（assets 10、ads 9、CDP 170、主题 19、拓展页面 5、内置拓展 11、用量栏设置 3）。不是整个 workspace 的全量测试。
 - Release 构建、签名及固定开发实例启动验收通过。已更新 `/Applications/Codex++.app`，实际运行版本与包版本均为 2.3.1，无测试环境覆盖，后端健康 ok，首页无推广、仅增强模式保持。正式版初次显示白页，刷新管理页后正常显示；没有重启官方 Codex。
 - 旧正式 app 与状态备份分别为 `dist/upgrade-v2.3.1/app-before-formal/Codex++.app` 和 `state-before-formal/`；开发实例也有独立备份，均不包含更新缓存和运行期 socket。
-- 源码恢复标签 `local/pre-update-v2.3.1-20261106`，交付标签 `local/v2.3.1-no-promotions-20261106`。未逐项实测官方 Codex 的状态栏读数及所有上游新功能。
+- 源码恢复标签 `local/pre-update-v2.3.1-20261106`，交付标签 `local/v2.3.1-no-promotions-verified-20261106`（原 `local/v2.3.1-no-promotions-20261106` 提前指向验收文档提交，不含升级代码，勿用于构建）。未逐项实测官方 Codex 的状态栏读数及所有上游新功能。
 
 ## 当前补丁与已退役补丁
 
