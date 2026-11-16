@@ -71,10 +71,58 @@ pub fn set_global_dictation_hotkey(enabled: bool, hotkey: String) -> CommandResu
 }
 
 #[tauri::command]
+pub async fn claude_local_status() -> CommandResult<Value> {
+    match tauri::async_runtime::spawn_blocking(codex_plus_core::claude_local_backend::status).await {
+        Ok(Ok(status)) => ok(
+            "Claude 原版本地模式状态已读取。",
+            serde_json::to_value(status).unwrap_or_else(|_| json!({})),
+        ),
+        Ok(Err(error)) => failed(&error.to_string(), json!({})),
+        Err(error) => failed(&format!("Claude 状态读取失败：{error}"), json!({})),
+    }
+}
+
+#[tauri::command]
+pub async fn claude_local_configure(
+    config: codex_plus_core::settings::ClaudeLocalSettings,
+) -> CommandResult<Value> {
+    match tauri::async_runtime::spawn_blocking(move || {
+        let status = codex_plus_core::claude_local_backend::configure(config)?;
+        sync_resident_helper();
+        Ok::<_, anyhow::Error>(status)
+    })
+    .await
+    {
+        Ok(Ok(status)) => ok(
+            "Claude 本地模式设置已保存。",
+            serde_json::to_value(status).unwrap_or_else(|_| json!({})),
+        ),
+        Ok(Err(error)) => failed(&error.to_string(), json!({})),
+        Err(error) => failed(&format!("Claude 设置失败：{error}"), json!({})),
+    }
+}
+
+#[tauri::command]
+pub async fn claude_local_action(action: String) -> CommandResult<Value> {
+    match tauri::async_runtime::spawn_blocking(move || {
+        codex_plus_core::claude_local_backend::perform(&action)
+    })
+    .await
+    {
+        Ok(Ok(payload)) => ok(
+            &payload.message,
+            serde_json::to_value(payload.status).unwrap_or_else(|_| json!({})),
+        ),
+        Ok(Err(error)) => failed(&error.to_string(), json!({})),
+        Err(error) => failed(&format!("Claude 本地模式操作失败：{error}"), json!({})),
+    }
+}
+
+#[tauri::command]
 pub async fn claude_localization_status() -> CommandResult<Value> {
     match tauri::async_runtime::spawn_blocking(codex_plus_core::claude_localization::status).await {
         Ok(Ok(status)) => ok(
-            "Claude 增强状态已读取。",
+            "补丁 Desktop 状态已读取。",
             serde_json::to_value(status).unwrap_or_else(|_| json!({})),
         ),
         Ok(Err(error)) => failed(&error.to_string(), json!({})),
@@ -119,7 +167,7 @@ pub async fn claude_localization_action(
             serde_json::to_value(payload.status).unwrap_or_else(|_| json!({})),
         ),
         Ok(Err(error)) => failed(&error.to_string(), json!({})),
-        Err(error) => failed(&format!("Claude 增强操作失败：{error}"), json!({})),
+        Err(error) => failed(&format!("补丁 Desktop 操作失败：{error}"), json!({})),
     }
 }
 
@@ -157,9 +205,9 @@ pub async fn claude_localization_set_extensions(enabled: bool) -> CommandResult<
     {
         Ok(Ok(status)) => ok(
             if enabled {
-                "Claude 拓展已开启，重启增强版后应用。"
+                "Claude 拓展已开启，重启补丁版后应用。"
             } else {
-                "Claude 拓展已关闭，重启增强版后应用。"
+                "Claude 拓展已关闭，重启补丁版后应用。"
             },
             serde_json::to_value(status).unwrap_or_else(|_| json!({})),
         ),
@@ -216,7 +264,7 @@ pub async fn claude_localization_set_bash_timeout(
         codex_plus_core::claude_localization::set_bash_timeout(timeout)
     }).await {
         Ok(Ok(status)) => ok(
-            "Bash 时间限制设置已保存；重启增强版后生效。",
+            "Bash 时间限制设置已保存；重启补丁版后生效。",
             serde_json::to_value(status).unwrap_or_else(|_| json!({})),
         ),
         Ok(Err(error)) => failed(&error.to_string(), json!({})),
@@ -341,6 +389,7 @@ struct WeixinRuntime {
     stop: Arc<AtomicBool>,
     codex_path: codex_plus_core::connect::WeixinCodexPath,
     outbound: codex_plus_core::connect::outbound::OutboundPolicy,
+    finished: tokio::sync::watch::Receiver<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -864,6 +913,7 @@ pub struct ScriptMarketPayload {
 #[serde(rename_all = "camelCase")]
 pub struct SkillsPayload {
     pub skills: Vec<codex_plus_core::skills::SkillEntry>,
+    pub inventory_ok: bool,
     pub repos: Vec<codex_plus_core::skills::SkillRepo>,
     pub repository_skills: Vec<codex_plus_core::skills::SkillEntry>,
     pub repo_counts: std::collections::BTreeMap<String, usize>,
@@ -1661,7 +1711,7 @@ fn stop_codex_multi_instance_blocking(
         .unwrap_or_else(|error| error.into_inner());
     if instance_id.trim() == "main" {
         return failed(
-            "主进程请使用重启 Codex 或退出管理器来结束。",
+            "主 Codex 请使用侧栏的「停止 Codex」。",
             CodexMultiInstancesPayload {
                 instances: Vec::new(),
             },
@@ -1768,7 +1818,7 @@ pub async fn restart_codex_multi_instance(
 fn restart_codex_multi_instance_blocking(instance_id: &str) -> CommandResult<Value> {
     if instance_id.trim() == "main" {
         return failed(
-            "主进程请使用顶部的重启 Codex。",
+            "主 Codex 请使用顶部的「重启 Codex」。",
             json!({ "instanceId": "main" }),
         );
     }
@@ -1812,6 +1862,57 @@ fn multi_instance_mutation_lock() -> &'static Mutex<()> {
     &LOCK
 }
 
+/// Compare install paths without requiring `canonicalize` to succeed.
+///
+/// A removed Store directory makes `canonicalize` fail. The saved identity often
+/// still has the `\\?\` prefix from an earlier successful canonicalize, and the
+/// fallback path does not. That prefix, slash style, and (on Windows) ASCII case
+/// are not a different executable (#3021).
+fn multi_instance_paths_match(left: &Path, right: &Path) -> bool {
+    let (left, right) = match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => (left, right),
+        _ => (left.to_path_buf(), right.to_path_buf()),
+    };
+    normalized_identity_path(&left) == normalized_identity_path(&right)
+}
+
+fn normalized_identity_path(path: &Path) -> String {
+    let mut text = path.to_string_lossy().into_owned();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        text = format!(r"\\{rest}");
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        text = rest.to_string();
+    }
+    #[cfg(windows)]
+    {
+        text.replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        text.trim_end_matches(['/', '\\']).to_string()
+    }
+}
+
+fn multi_instance_executable_matches(app_path: &Path, recorded: &Path) -> bool {
+    let built = codex_plus_core::app_paths::build_codex_executable(app_path);
+    if multi_instance_paths_match(&built, recorded) {
+        return true;
+    }
+    // The Store manifest selects `<package>/app/<exe>`. Once that directory is
+    // gone, `build_codex_executable` falls back to `<package>/<exe>`. Accept the
+    // historical `app` layout only when that fallback cannot be resolved, so a
+    // live file is never treated as a different binary in the same package.
+    if built.canonicalize().is_ok() {
+        return false;
+    }
+    let Some(file_name) = built.file_name().filter(|name| !name.is_empty()) else {
+        return false;
+    };
+    multi_instance_paths_match(&app_path.join("app").join(file_name), recorded)
+}
+
 fn multi_manifest_identity_matches(
     instance: &CodexMultiInstance,
     identity: &codex_plus_core::multi_worker::CodexInstanceIdentity,
@@ -1821,19 +1922,12 @@ fn multi_manifest_identity_matches(
         && identity.generation == instance.generation
         && identity.debug_port == instance.debug_port
         && identity.helper_port == instance.helper_port
-        && instance
-            .user_data_dir
-            .as_ref()
-            .and_then(|path| Path::new(path).canonicalize().ok())
-            .as_ref()
-            == Some(&identity.user_data_dir)
-        && instance
-            .app_path
-            .as_ref()
-            .map(|path| codex_plus_core::app_paths::build_codex_executable(Path::new(path)))
-            .map(|path| path.canonicalize().unwrap_or(path))
-            .as_ref()
-            == Some(&identity.executable)
+        && instance.user_data_dir.as_deref().is_some_and(|path| {
+            multi_instance_paths_match(Path::new(path), &identity.user_data_dir)
+        })
+        && instance.app_path.as_deref().is_some_and(|path| {
+            multi_instance_executable_matches(Path::new(path), &identity.executable)
+        })
 }
 
 fn load_multi_instance_manifest(root: &Path) -> anyhow::Result<CodexMultiInstance> {
@@ -1921,10 +2015,11 @@ fn load_multi_instance_manifest_with_probes(
     // 「未知」，停止也会拒绝写回执，用户就被卡住（#2904）。这里只按记录里的 PID +
     // 创建身份确认那一代进程确已退出、worker 已退出、数据目录与端口无人使用（两次），
     // 才把这条过期记录标为已停止并丢弃失效身份；任何一步不确定都保持原样，不结束任何进程。
-    let orphaned = instance.status != "stopped"
-        && !multi_instance_orphaned_identities(&instance).is_empty()
-        && orphan_absent(&instance).unwrap_or(false)
-        && orphan_absent(&instance).unwrap_or(false);
+    // 重启前已停止、清单仍留着旧身份的记录同样适用（#2940）：否则列表一直「未知」，
+    // 重新启动也因身份对不上无法确认旧实例已释放。
+    let orphaned = !multi_instance_orphaned_identities(&instance).is_empty()
+        && multi_instance_orphan_probe_succeeded(&instance, &orphan_absent)
+        && multi_instance_orphan_probe_succeeded(&instance, &orphan_absent);
     if orphaned {
         instance.identity = None;
         instance.pid = None;
@@ -1981,10 +2076,35 @@ fn load_multi_instance_manifest_with_probes(
     Ok(instance)
 }
 
+/// `Err` from the stale-record probe used to become `false` with no log, so a
+/// record stuck after a Store upgrade looked identical to "process still live".
+fn multi_instance_orphan_probe_succeeded(
+    instance: &CodexMultiInstance,
+    absent: &impl Fn(&CodexMultiInstance) -> anyhow::Result<bool>,
+) -> bool {
+    match absent(instance) {
+        Ok(absent) => absent,
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.multi_instance_stale_record_probe_failed",
+                json!({
+                    "instance_id": instance.instance_id,
+                    "generation": instance.generation,
+                    "message": format!("{error:#}"),
+                }),
+            );
+            false
+        }
+    }
+}
+
 /// 清单或同代回执里记录了进程身份，但它已对不上当前清单时，返回需要核验退出的身份。
 ///
 /// 身份与清单一致时返回空，交给原有核验路径；身份不属于本实例本代、缺少 PID 或
 /// 创建身份时同样返回空——没有可靠依据就不清理。
+///
+/// 已停止的记录只在清单本身还留着对不上的身份时才需要核验（#2940）：这种记录在列表里
+/// 会一直显示「未知」，也挡住重新启动；清单无身份的已停止记录本来就显示已停止，不用碰。
 fn multi_instance_orphaned_identities(
     instance: &CodexMultiInstance,
 ) -> Vec<&codex_plus_core::multi_worker::CodexInstanceIdentity> {
@@ -1992,7 +2112,7 @@ fn multi_instance_orphaned_identities(
         || instance.instance_id == "main"
         || instance.instance_id.is_empty()
         || instance.generation == 0
-        || instance.status == "stopped"
+        || instance.status == "stopped" && instance.identity.is_none()
         || instance
             .identity
             .as_ref()
@@ -2633,8 +2753,16 @@ fn finish_multi_instance_cleanup(
         Ok(())
     });
     let result = multi_instance_cleanup_result(instance, &verified);
-    write_multi_instance_result(root, instance, &result)?;
-    verified
+    match (
+        verified,
+        write_multi_instance_result(root, instance, &result),
+    ) {
+        // A receipt-write failure must not hide the cleanup error that made the
+        // receipt necessary (#3021). Callers surface `{error:#}` to the user.
+        (Err(cleanup), Err(write)) => Err(anyhow::anyhow!("{cleanup:#}（回执未写入：{write:#}）")),
+        (_verified, Err(write)) => Err(write),
+        (verified, Ok(())) => verified,
+    }
 }
 
 fn multi_instance_cleanup_result(
@@ -2849,6 +2977,16 @@ fn write_multi_instance_codex_home(
         helper_port,
         preserve_nonprovider,
     )?;
+    if profile.id == codex_plus_core::gateway::apply::CODEX_GATEWAY_RELAY_ID
+        && let Some(catalog) = codex_plus_core::model_catalog::gateway_catalog_path(default_home)
+        && catalog == default_home.join("model-catalogs/codex-plus-gateway.json")
+        && catalog.is_file()
+    {
+        let config_path = codex_home.join("config.toml");
+        let mut doc = std::fs::read_to_string(&config_path)?.parse::<toml_edit::DocumentMut>()?;
+        doc["model_catalog_json"] = toml_edit::value(catalog.to_string_lossy().to_string());
+        codex_plus_core::settings::atomic_write(&config_path, doc.to_string().as_bytes())?;
+    }
     Ok(profile)
 }
 
@@ -3019,8 +3157,12 @@ enum RestartDisposition {
     StopAndRestart,
 }
 
-fn restart_disposition(sync_active_relay: bool, app_running: bool) -> RestartDisposition {
-    if !sync_active_relay && !app_running {
+fn restart_disposition(
+    sync_active_relay: bool,
+    app_running: bool,
+    is_windows: bool,
+) -> RestartDisposition {
+    if !is_windows && !sync_active_relay && !app_running {
         RestartDisposition::LaunchOnly
     } else {
         RestartDisposition::StopAndRestart
@@ -3033,15 +3175,24 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
         Err(message) => return failed(message, json!({})),
     };
     let request = normalize_launch_request(request);
+    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+        "manager.restart_requested",
+        json!({
+            "debug_port": request.debug_port,
+            "helper_port": request.helper_port,
+            "app_path": request.app_path.trim(),
+            "sync_active_relay": request.sync_active_relay
+        }),
+    );
     // 按本实例的调试端口判定是否在跑。
     // 早先用 `find_codex_processes_for_debug_port`，但它在非 macOS 上返回全部
     // Codex 进程：Windows 上只要有多开实例在跑，就会把「主 Codex 没开」误判成
     // 「已运行」，进而走进重启分支去停进程。
     let app_running = codex_plus_core::cdp::endpoint_available(request.debug_port);
-    if restart_disposition(request.sync_active_relay, app_running) == RestartDisposition::LaunchOnly
+    if restart_disposition(request.sync_active_relay, app_running, cfg!(windows))
+        == RestartDisposition::LaunchOnly
     {
-        // 调试端口不可连不代表 Codex 没在跑：Windows 商店版主 Codex 可能开着却没带端口
-        // （issue #2764）。走重启专用的启动，由 launcher 识别并结束它后再启动。
+        // Windows 始终先执行停止流程；其他平台保留原来的直接启动分支。
         return spawn_codex_plus_launch_with(
             request,
             "Codex 未运行，已按直接启动方式在后台唤起。",
@@ -3087,14 +3238,19 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
         10,
     ));
     let native_browser_shutdown = match stop_codex_plus_for_restart(
-        || stop_main_codex_process(request.debug_port),
+        || stop_main_codex_process(&request).map(|_| ()),
         codex_plus_launcher::stop,
         wait_native_browser_shutdown,
     ) {
         Ok(shutdown) => shutdown,
         Err(error) => {
+            let message = restart_stop_failure_message(&error);
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.restart_stop_failed",
+                json!({"debug_port": request.debug_port, "message": message}),
+            );
             return failed(
-                &restart_stop_failure_message(&error),
+                &message,
                 json!({"debugPort": request.debug_port, "helperPort": request.helper_port}),
             );
         }
@@ -3117,7 +3273,7 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
     }
     let home = codex_plus_core::relay_config::default_codex_home_dir();
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-        "manager.restart_requested",
+        "manager.restart_starting",
         json!({
             "debug_port": request.debug_port,
             "helper_port": request.helper_port,
@@ -3143,11 +3299,11 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
     }
     let mut restart_message = "Codex 已请求重启，启动任务正在后台运行。".to_string();
     match restart_codex_plus_after_stop(&request, &home, settings.as_ref(), |request| {
-        spawn_after_provider_guard_release(
-            provider_guard,
-            request,
-            start_embedded_launcher_for_restart,
-        )
+        #[cfg(windows)]
+        let start = start_embedded_launcher;
+        #[cfg(not(windows))]
+        let start = start_embedded_launcher_for_restart;
+        spawn_after_provider_guard_release(provider_guard, request, start)
     }) {
         Ok(warnings) => {
             for warning in warnings {
@@ -3187,24 +3343,64 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
     }
 }
 
-/// 结束主 Codex 进程并确认调试端口已关闭。重启和「停止 Codex」共用。
-fn stop_main_codex_process(debug_port: u16) -> anyhow::Result<()> {
-    // 主实例在 Windows 上是 AUMID 激活的，命令行未必带调试端口；
-    // 这里允许「按端口没匹配到就退回全局结束」，否则会卡在
-    // 「Codex 进程尚未退出」。多开页的结束走的是不允许退回的那个版本。
-    // macOS 上按端口没匹配到时，退回结束没带调试端口的主进程（外部启动的 Codex）。
+/// 结束主 Codex 进程并确认退出。重启和「停止 Codex」共用。
+fn stop_main_codex_process(request: &LaunchRequest) -> anyhow::Result<usize> {
     #[cfg(windows)]
-    codex_plus_core::watcher::stop_codex_processes_for_debug_port_with_fallback(debug_port, true);
+    {
+        let session = codex_plus_launcher::session_snapshot();
+        let needs_settings = (session.launch_extra_args.is_none() && !session.owned)
+            || (session.app_dir.is_none() && request.app_path.trim().is_empty());
+        let settings = needs_settings
+            .then(|| SettingsStore::default().load())
+            .transpose()?;
+        // 设置可能在启动后被编辑；停止时沿用该会话真正使用过的参数。
+        let launch_extra_args = session
+            .launch_extra_args
+            .as_deref()
+            .or_else(|| {
+                (!session.owned).then(|| {
+                    settings
+                        .as_ref()
+                        .map(|settings| settings.codex_extra_args.as_slice())
+                        .unwrap_or_default()
+                })
+            });
+        let owned_debug_port = session.owned.then_some(session.debug_port).flatten();
+        let app_dir = session.app_dir.or_else(|| {
+            codex_plus_core::app_paths::resolve_codex_app_dir_with_saved(
+                (!request.app_path.trim().is_empty())
+                    .then(|| Path::new(request.app_path.trim())),
+                settings
+                    .as_ref()
+                    .map(|settings| settings.codex_app_path.as_str()),
+            )
+        });
+        let app_dir = app_dir.ok_or_else(|| anyhow::anyhow!("无法核实 Codex 应用路径"))?;
+        let executable = codex_plus_core::app_paths::build_codex_executable(&app_dir);
+        return codex_plus_core::watcher::stop_windows_main_codex_processes_with_args_and_wait(
+            &executable,
+            owned_debug_port,
+            launch_extra_args,
+        );
+    }
+    #[cfg(not(windows))]
+    let was_running = codex_plus_core::cdp::endpoint_available(request.debug_port)
+        || main_codex_running_without_debug_port();
+    #[cfg(not(windows))]
+    let debug_port = request.debug_port;
     #[cfg(target_os = "macos")]
     codex_plus_core::watcher::stop_main_codex_processes_and_wait(debug_port);
     #[cfg(not(any(windows, target_os = "macos")))]
     codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(debug_port);
+    #[cfg(not(windows))]
     anyhow::ensure!(
         !codex_plus_core::cdp::endpoint_available(debug_port),
         "Codex 进程尚未退出"
     );
+    #[cfg(not(windows))]
     anyhow::ensure!(!main_codex_running_without_debug_port(), "Codex 进程尚未退出");
-    Ok(())
+    #[cfg(not(windows))]
+    Ok(usize::from(was_running))
 }
 
 /// 主 Codex 开着却没带调试端口：从 Dock / Finder 等外部启动，调试端口探测不到它。
@@ -3237,7 +3433,16 @@ fn stop_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
         Err(message) => return failed(message, json!({})),
     };
     let request = normalize_launch_request(request);
-    if !codex_plus_core::cdp::endpoint_available(request.debug_port)
+    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+        "manager.stop_requested",
+        json!({
+            "debug_port": request.debug_port,
+            "helper_port": request.helper_port,
+            "app_path": request.app_path.trim()
+        }),
+    );
+    if !cfg!(windows)
+        && !codex_plus_core::cdp::endpoint_available(request.debug_port)
         && !main_codex_running_without_debug_port()
     {
         return ok("Codex 没有在运行。", json!({}));
@@ -3257,23 +3462,41 @@ fn stop_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
         "user_stopping",
         10,
     ));
+    let mut stopped_count = None;
     match stop_codex_plus_for_restart(
-        || stop_main_codex_process(request.debug_port),
+        || {
+            let count = stop_main_codex_process(&request)?;
+            stopped_count = Some(count);
+            Ok(())
+        },
         codex_plus_launcher::stop,
         wait_native_browser_shutdown,
     ) {
         Ok(_) => {
+            let stopped_count = stopped_count.unwrap_or_default();
+            let message = if stopped_count == 0 {
+                "Codex 没有在运行。"
+            } else {
+                "Codex 已停止。"
+            };
             let _ = StatusStore::default().save_latest(&requested_launch_status_with_phase(
                 &request,
                 "stopped",
-                "Codex 已停止。",
+                message,
                 current_timestamp_ms(),
                 "user_stopped",
                 100,
             ));
-            ok("Codex 已停止。", json!({}))
+            ok(message, json!({ "stoppedCount": stopped_count }))
         }
-        Err(error) => failed(&stop_failure_message(&error), json!({})),
+        Err(error) => {
+            let message = stop_failure_message(&error);
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.stop_failed",
+                json!({"debug_port": request.debug_port, "message": message}),
+            );
+            failed(&message, json!({}))
+        }
     }
 }
 
@@ -3366,9 +3589,13 @@ pub fn sync_resident_helper() -> Option<u16> {
         .is_some_and(codex_plus_core::claude_localization::voice_input_needs_helper);
     // 第四个信号：有 Agent 开着网关模式，它的请求随时会打到 helper 的 `/gw/*`。
     let gateway_needs_helper = codex_plus_core::gateway::needs_helper();
+    let claude_local_needs_helper = settings
+        .as_ref()
+        .is_some_and(|settings| settings.claude_desktop_local.enabled);
     if !settings_need_proxy
         && !claude_voice_needs_helper
         && !gateway_needs_helper
+        && !claude_local_needs_helper
         && !codex_plus_core::relay_config::live_config_uses_managed_protocol_proxy_in_home(&home)
     {
         return None;
@@ -3955,6 +4182,21 @@ pub async fn weixin_connect_qr_status() -> CommandResult<WeixinQrPayload> {
     };
 
     if qr_status.status == "confirmed" {
+        let _control = weixin_control().lock().await;
+        let still_current = weixin_qr_session()
+            .lock()
+            .map(|current| {
+                current
+                    .as_ref()
+                    .is_some_and(|current| current.qr_code == session.qr_code)
+            })
+            .unwrap_or(false);
+        if !still_current {
+            return failed(
+                "微信登录二维码已更新，请使用当前二维码。",
+                empty_weixin_qr_payload("missing"),
+            );
+        }
         if qr_status.bot_token.trim().is_empty() || qr_status.ilink_bot_id.trim().is_empty() {
             return failed(
                 "微信已确认登录，但网关未返回完整凭据。",
@@ -3969,48 +4211,92 @@ pub async fn weixin_connect_qr_status() -> CommandResult<WeixinQrPayload> {
             );
         }
         let store = SettingsStore::default();
-        let mut settings = store.load().unwrap_or_default();
-        settings.weixin_connect_token = qr_status.bot_token;
-        settings.weixin_connect_account_id = qr_status.ilink_bot_id.clone();
-        if !qr_status.baseurl.trim().is_empty() {
-            settings.weixin_connect_base_url =
-                qr_status.baseurl.trim().trim_end_matches('/').to_string();
+        let settings = match store.load() {
+            Ok(settings) => settings,
+            Err(error) => {
+                return failed(
+                    &format!("微信登录成功，但读取连接设置失败：{error}"),
+                    empty_weixin_qr_payload("failed"),
+                );
+            }
+        };
+        let base_url = if !qr_status.baseurl.trim().is_empty() {
+            qr_status.baseurl.trim().trim_end_matches('/').to_string()
         } else {
-            settings.weixin_connect_base_url = session.base_url.clone();
-        }
+            session.base_url.clone()
+        };
+        let mut patch = json!({
+            "revision": settings.settings_revision,
+            "weixinConnectEnabled": true,
+            "weixinConnectToken": qr_status.bot_token,
+            "weixinConnectAccountId": qr_status.ilink_bot_id,
+            "weixinConnectBaseUrl": base_url,
+            "weixinConnectRouteTag": session.route_tag,
+        });
         if settings.weixin_connect_allow_from.trim().is_empty()
             && !qr_status.ilink_user_id.trim().is_empty()
         {
-            settings.weixin_connect_allow_from = qr_status.ilink_user_id.clone();
+            patch["weixinConnectAllowFrom"] = json!(qr_status.ilink_user_id);
         }
-        settings.weixin_connect_route_tag = session.route_tag;
-        if let Err(error) = store.save(&settings) {
-            return failed(
-                &format!("微信登录成功，但保存连接凭据失败：{error}"),
-                WeixinQrPayload {
-                    qr_status: "failed".to_string(),
-                    qr_content: session.qr_content,
-                    qr_svg: session.qr_svg,
-                    account_id: qr_status.ilink_bot_id,
-                    linked_user_id: qr_status.ilink_user_id,
-                    has_token: false,
-                },
-            );
-        }
+        let settings = match store.update(patch) {
+            Ok(settings) => settings,
+            Err(error) => {
+                return failed(
+                    &format!("微信登录成功，但保存连接凭据失败：{error}"),
+                    WeixinQrPayload {
+                        qr_status: "failed".to_string(),
+                        qr_content: session.qr_content,
+                        qr_svg: session.qr_svg,
+                        account_id: qr_status.ilink_bot_id,
+                        linked_user_id: qr_status.ilink_user_id,
+                        has_token: false,
+                    },
+                );
+            }
+        };
         if let Ok(mut current) = weixin_qr_session().lock() {
-            *current = None;
+            if current
+                .as_ref()
+                .is_some_and(|current| current.qr_code == session.qr_code)
+            {
+                *current = None;
+            }
         }
-        return ok(
-            "微信扫码登录成功。",
-            WeixinQrPayload {
-                qr_status: "confirmed".to_string(),
-                qr_content: String::new(),
-                qr_svg: String::new(),
-                account_id: qr_status.ilink_bot_id,
-                linked_user_id: qr_status.ilink_user_id,
-                has_token: true,
+        let payload = WeixinQrPayload {
+            qr_status: "confirmed".to_string(),
+            qr_content: String::new(),
+            qr_svg: String::new(),
+            account_id: qr_status.ilink_bot_id,
+            linked_user_id: qr_status.ilink_user_id,
+            has_token: true,
+        };
+        let previous = match weixin_runtime().lock() {
+            Ok(runtime) => runtime.as_ref().map(|runtime| {
+                runtime.stop.store(true, Ordering::SeqCst);
+                runtime.outbound.set(false, "", "");
+                runtime.finished.clone()
+            }),
+            Err(_) => {
+                return failed("微信登录成功，但连接运行锁已损坏。", payload);
             },
-        );
+        };
+        if let Some(mut finished) = previous {
+            while !*finished.borrow_and_update() {
+                if let Err(error) = finished.changed().await {
+                    return failed(
+                        &format!("微信登录成功，但旧连接退出异常：{error}"),
+                        payload,
+                    );
+                }
+            }
+        }
+        return match spawn_weixin_connect(settings) {
+            Ok(_) => ok("微信扫码登录成功，正在启动连接。", payload),
+            Err(error) => failed(
+                &format!("微信登录成功，但启动连接失败：{error}"),
+                payload,
+            ),
+        };
     }
 
     ok(
@@ -4081,7 +4367,8 @@ pub fn weixin_connect_reset_session(peer_id: String, account_id: String) -> Resu
 }
 
 #[tauri::command]
-pub fn weixin_connect_start() -> CommandResult<codex_plus_core::connect::WeixinConnectStatus> {
+pub async fn weixin_connect_start() -> CommandResult<codex_plus_core::connect::WeixinConnectStatus> {
+    let _control = weixin_control().lock().await;
     let store = SettingsStore::default();
     let mut settings = store.load().unwrap_or_default();
     if settings.weixin_connect_token.trim().is_empty() {
@@ -4104,7 +4391,8 @@ pub fn weixin_connect_start() -> CommandResult<codex_plus_core::connect::WeixinC
 }
 
 #[tauri::command]
-pub fn weixin_connect_stop() -> CommandResult<codex_plus_core::connect::WeixinConnectStatus> {
+pub async fn weixin_connect_stop() -> CommandResult<codex_plus_core::connect::WeixinConnectStatus> {
+    let _control = weixin_control().lock().await;
     let stopping = weixin_runtime()
         .lock()
         .ok()
@@ -4116,19 +4404,20 @@ pub fn weixin_connect_stop() -> CommandResult<codex_plus_core::connect::WeixinCo
             })
         })
         .unwrap_or(false);
-    let store = SettingsStore::default();
-    if let Ok(mut settings) = store.load() {
-        settings.weixin_connect_enabled = false;
-        let _ = store.save(&settings);
-    }
     if let Ok(mut status) = weixin_status().lock() {
         if stopping {
             status.state = "stopping".to_string();
-            status.message = "正在停止微信连接，当前长轮询结束后生效。".to_string();
+            status.message = "正在停止微信连接。".to_string();
         } else {
             status.state = "stopped".to_string();
             status.message = "微信连接已停止。".to_string();
         }
+    }
+    if let Err(error) = SettingsStore::default().update(json!({"weixinConnectEnabled": false})) {
+        let message = format!("已请求停止微信连接，但保存设置失败，下次启动时可能自动连接：{error}");
+        let mut status = current_weixin_status();
+        status.message = message.clone();
+        return failed(&message, status);
     }
     ok(
         if stopping {
@@ -4299,10 +4588,12 @@ fn spawn_weixin_connect(
     }
     let codex_path = codex_plus_core::connect::WeixinCodexPath::new(&config.codex_path);
     let outbound = SettingsStore::default().weixin_outbound_policy(&config, Arc::clone(&stop))?;
+    let (finished_tx, finished_rx) = tokio::sync::watch::channel(false);
     *runtime = Some(WeixinRuntime {
         stop: Arc::clone(&stop),
         codex_path: codex_path.clone(),
         outbound: outbound.clone(),
+        finished: finished_rx,
     });
     drop(runtime);
     let status = weixin_status();
@@ -4336,6 +4627,7 @@ fn spawn_weixin_connect(
         {
             *runtime = None;
         }
+        finished_tx.send_replace(true);
     });
     Ok(current_weixin_status())
 }
@@ -4348,6 +4640,11 @@ fn weixin_qr_session() -> &'static Mutex<Option<WeixinQrSession>> {
 fn weixin_runtime() -> &'static Mutex<Option<WeixinRuntime>> {
     static RUNTIME: OnceLock<Mutex<Option<WeixinRuntime>>> = OnceLock::new();
     RUNTIME.get_or_init(|| Mutex::new(None))
+}
+
+fn weixin_control() -> &'static tokio::sync::Mutex<()> {
+    static CONTROL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    CONTROL.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 fn weixin_status() -> codex_plus_core::connect::SharedWeixinConnectStatus {
@@ -4428,6 +4725,16 @@ pub fn load_settings(skip_local_provider_import: Option<bool>) -> CommandResult<
                     );
                 }
             };
+            if let Err(error) =
+                codex_plus_core::relay_config::migrate_managed_model_catalog_pointer_in_home(
+                    &home, &settings,
+                )
+            {
+                log_manager_event(
+                    "manager.model_catalog_migration_failed",
+                    json!({ "message": format!("{error:#}") }),
+                );
+            }
             ok(
                 "设置已加载。",
                 SettingsPayload {
@@ -4455,7 +4762,7 @@ pub fn save_settings(
     if let Some(revision) = expected_revision {
         settings.settings_revision = revision;
     }
-    let settings = normalize_settings_before_save(settings);
+    let mut settings = normalize_settings_before_save(settings);
     // 保存诊断：供应商模型列表被改小/改大时能直接看出「提交上来的到底是什么」。
     // 用户反馈过「删掉一行保存后又变回三行」，只有把每次保存的行数记下来才能区分
     // 「界面没提交改动」和「提交了又被别处覆盖」。
@@ -4485,6 +4792,8 @@ pub fn save_settings(
     };
     let store = SettingsStore::default();
     let previous = store.load().unwrap_or_default();
+    // 原生登录仅由独立选择命令更新，普通偏好表单不能覆盖刚发布的身份。
+    settings.native_auth_selection = previous.native_auth_selection.clone();
     if let Err(error) = codex_plus_core::connect::outbound::validate_settings_change(&previous, &settings) {
         return failed(
             &error.to_string(),
@@ -6816,6 +7125,15 @@ pub async fn reload_user_scripts() -> CommandResult<SettingsPayload> {
                 )
             }
         }
+        Err(error) if error.is::<codex_plus_core::user_scripts::ReloadOutcomeUnknown>() => {
+            let mut payload = fallback_settings_payload();
+            codex_plus_core::user_scripts::mark_inventory_runtime_unknown(&mut payload.user_scripts);
+            CommandResult {
+                status: "warning".to_string(),
+                message: error.to_string(),
+                payload,
+            }
+        }
         Err(error) => failed(
             &format!("用户脚本热重载失败：{error}"),
             fallback_settings_payload(),
@@ -6885,7 +7203,7 @@ pub fn set_user_scripts_enabled(enabled: bool, host: Option<String>) -> CommandR
     match result {
         Ok(_) => settings_payload(
             if claude && enabled {
-                "Claude Desktop 拓展已开启，重新启动增强版 Claude 后加载。"
+                "Claude Desktop 拓展已开启，重新启动补丁版 Claude 后加载。"
             } else if claude {
                 "Claude Desktop 拓展已关闭。"
             } else if enabled {
@@ -6984,7 +7302,7 @@ pub async fn extension_manager_data(key: String, name: String, params: Option<Va
                         _ => public::gateway_quota(&gateway, gateway::quota::get),
                     })
                 }
-                "installedSkills" => Ok(public::installed_skills(&default_skills_manager().local_inventory())),
+                "installedSkills" => Ok(public::installed_skills(&default_skills_manager().try_local_inventory()?)),
                 "installedPlugins" => codex_plus_core::plugin_market::installed_summary(&codex_plus_core::codex_home::default_codex_home_dir()),
                 "agentCollaboration" => {
                     let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(50).clamp(1, 200) as usize;
@@ -7065,7 +7383,7 @@ pub fn set_user_script_enabled(key: String, enabled: bool, host: Option<String>)
     match result {
         Ok(_) => settings_payload(
             if claude && enabled {
-                "Claude Desktop 拓展已启用，重新启动增强版 Claude 后加载。"
+                "Claude Desktop 拓展已启用，重新启动补丁版 Claude 后加载。"
             } else if claude {
                 "Claude Desktop 拓展已停用。"
             } else if enabled {
@@ -7104,7 +7422,7 @@ pub fn delete_user_script(key: String) -> CommandResult<SettingsPayload> {
 ///
 /// 单个仓库失败（限流、网络、仓库删了）不影响其它仓库，错误单独收集回前端。
 #[tauri::command]
-pub async fn refresh_skill_catalog() -> CommandResult<SkillsPayload> {
+pub async fn refresh_skill_catalog() -> Result<CommandResult<SkillsPayload>, String> {
     let manager = default_skills_manager();
     let repos = manager.list_repos();
     let mut repo_errors = Vec::new();
@@ -7155,20 +7473,28 @@ pub async fn refresh_skill_catalog() -> CommandResult<SkillsPayload> {
     } else {
         format!("Skills 列表已刷新，{} 个仓库拉取失败。", repo_errors.len())
     };
-    let payload = skills_payload(&manager, &all_cached_repo_skills(), repo_errors);
-    if payload.repo_errors.is_empty() {
-        ok(&message, payload)
-    } else {
-        failed(&message, payload)
-    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let payload = skills_payload(&manager, &all_cached_repo_skills(), repo_errors);
+        if payload.repo_errors.is_empty() {
+            ok(&message, payload)
+        } else {
+            failed(&message, payload)
+        }
+    }).await.map_err(|error| format!("读取 Skill 目录失败：{error}"))
 }
 
 /// 只读本地状态，不联网。切到 Skills 页时先用它把已装的列出来。
 #[tauri::command]
-pub fn list_installed_skills() -> CommandResult<SkillsPayload> {
-    let manager = default_skills_manager();
-    let payload = current_skills_payload(&manager);
-    ok("已加载本地 Skills。", payload)
+pub async fn list_installed_skills() -> Result<CommandResult<SkillsPayload>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let manager = default_skills_manager();
+        let payload = current_skills_payload(&manager);
+        if payload.inventory_ok {
+            ok("已加载本地 Skills。", payload)
+        } else {
+            failed("读取本地 Skills 失败。", payload)
+        }
+    }).await.map_err(|error| format!("读取本地 Skills 失败：{error}"))
 }
 
 /// 导入 cc-switch 已安装的 Skills。cc-switch 的 Skill 文件位于
@@ -7357,22 +7683,24 @@ async fn install_or_update_skill(
 }
 
 #[tauri::command]
-pub fn set_skill_enabled(id: String, enabled: bool) -> CommandResult<SkillsPayload> {
-    let manager = default_skills_manager();
-    match manager.set_enabled(id.trim(), enabled) {
-        Ok(()) => ok(
-            if enabled {
-                "Skill 已启用，下次对话生效。"
-            } else {
-                "Skill 已停用。"
-            },
-            current_skills_payload(&manager),
-        ),
-        Err(error) => failed(
-            &format!("Skill 启停失败：{error}"),
-            current_skills_payload(&manager),
-        ),
-    }
+pub async fn set_skill_enabled(id: String, enabled: bool) -> Result<CommandResult<SkillsPayload>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let manager = default_skills_manager();
+        match manager.set_enabled(id.trim(), enabled) {
+            Ok(()) => ok(
+                if enabled {
+                    "Skill 已启用，下次对话生效。"
+                } else {
+                    "Skill 已停用。"
+                },
+                current_skills_payload(&manager),
+            ),
+            Err(error) => failed(
+                &format!("Skill 启停失败：{error}"),
+                current_skills_payload(&manager),
+            ),
+        }
+    }).await.map_err(|error| format!("Skill 启停任务失败：{error}"))
 }
 
 #[tauri::command]
@@ -7515,6 +7843,18 @@ pub async fn inspect_skill_repo(
     match codex_plus_core::skills::resolve_repo_skills(repo.clone(), &snapshot.skills).await {
         Ok((resolved, skills)) => {
             let count = skills.len();
+            let worker_manager = manager.clone();
+            let worker_skills = skills.clone();
+            let entries = match tauri::async_runtime::spawn_blocking(move || {
+                worker_manager.try_merge_entries(&worker_skills)
+            }).await.map_err(|error| format!("读取 Skill 状态任务失败：{error}"))
+                .and_then(|result| result.map_err(|error| format!("{error:#}"))) {
+                Ok(entries) => entries,
+                Err(error) => return failed(
+                    &format!("读取 Skill 状态失败：{error}"),
+                    SkillRepositoryPayload { repo: resolved, skills: Vec::new(), skill_count: count },
+                ),
+            };
             // 预览未保存仓库不会修改仓库设置。
             {
                 let _coordination = skills_repo_coordination();
@@ -7528,9 +7868,7 @@ pub async fn inspect_skill_repo(
                 &format!("已解析仓库，发现 {count} 个 Skill。"),
                 SkillRepositoryPayload {
                     repo: resolved,
-                    skills: manager
-                        .merge_entries(&skills)
-                        .into_iter()
+                    skills: entries.into_iter()
                         .filter(|s| {
                             skills
                                 .iter()
@@ -7571,19 +7909,10 @@ pub fn delete_skill_repo(key: String) -> CommandResult<SkillsPayload> {
 fn skills_payload(
     manager: &codex_plus_core::skills::SkillsManager,
     remote: &[codex_plus_core::skills::RemoteSkill],
-    repo_errors: Vec<String>,
+    mut repo_errors: Vec<String>,
 ) -> SkillsPayload {
     let repos = manager.list_repos();
     let all_remote = all_cached_repo_skills();
-    let repository_skills = manager
-        .merge_entries(&all_remote)
-        .into_iter()
-        .filter(|skill| {
-            all_remote
-                .iter()
-                .any(|r| r.id == skill.id && r.repo_key == skill.repo_key)
-        })
-        .collect();
     let repo_counts = repo_skill_cache()
         .lock()
         .ok()
@@ -7608,12 +7937,43 @@ fn skills_payload(
         })
         .cloned()
         .collect();
+    let mut reused_inventory = None;
+    let repository_skills = if all_remote.is_empty() {
+        Vec::new()
+    } else {
+        match manager.try_merge_entries(&all_remote) {
+            Ok(entries) => {
+                let repository = entries.iter().filter(|skill|
+                    all_remote.iter().any(|r| r.id == skill.id && r.repo_key == skill.repo_key)
+                ).cloned().collect();
+                if remote == all_remote { reused_inventory = Some(Ok(entries)); }
+                repository
+            }
+            Err(error) => {
+                if remote == all_remote {
+                    reused_inventory = Some(Err(error));
+                } else {
+                    repo_errors.push(format!("读取 Skill 状态失败：{error:#}"));
+                }
+                Vec::new()
+            }
+        }
+    };
+    let skills = reused_inventory.unwrap_or_else(|| {
+        if remote.is_empty() { manager.try_local_inventory() } else { manager.try_merge_entries(&remote) }
+    });
+    let inventory_ok = skills.is_ok();
+    let skills = match skills {
+        Ok(skills) => skills,
+        Err(error) => {
+            let message = format!("读取 Skill 状态失败：{error:#}");
+            if !repo_errors.contains(&message) { repo_errors.push(message); }
+            Vec::new()
+        }
+    };
     SkillsPayload {
-        skills: if remote.is_empty() {
-            manager.local_inventory()
-        } else {
-            manager.merge_entries(&remote)
-        },
+        skills,
+        inventory_ok,
         repos,
         repository_skills,
         repo_counts,
@@ -7634,7 +7994,7 @@ fn current_skills_payload(manager: &codex_plus_core::skills::SkillsManager) -> S
 }
 
 pub(crate) fn default_skills_manager() -> codex_plus_core::skills::SkillsManager {
-    codex_plus_core::skills::SkillsManager::new(
+    let manager = codex_plus_core::skills::SkillsManager::new(
         codex_plus_core::paths::default_skills_source_dir(),
         codex_plus_core::paths::default_skill_backups_dir(),
         codex_plus_core::paths::default_skills_state_path(),
@@ -7650,36 +8010,48 @@ pub(crate) fn default_skills_manager() -> codex_plus_core::skills::SkillsManager
             "grok".to_string(),
             codex_plus_core::grok_config::default_grok_home_dir().join("skills"),
         ),
-    ])
+    ]);
+    let shared = std::env::var_os("CODEX_PLUS_SHARED_SKILLS_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".agents").join("skills")));
+    match shared {
+        Some(path) => manager.with_shared_skills_dir(path),
+        None => manager,
+    }
 }
 
 /// 把 Skill 启用到 / 停用于某个 Agent（codex / claude / grok）。
 #[tauri::command]
-pub fn set_skill_enabled_for(
+pub async fn set_skill_enabled_for(
     agent: String,
     id: String,
     enabled: bool,
-) -> CommandResult<SkillsPayload> {
-    let manager = default_skills_manager();
-    let name = match agent.as_str() {
-        "claude" => "Claude Code",
-        "grok" => "Grok",
-        _ => "Codex",
-    };
-    match manager.set_enabled_for(agent.trim(), id.trim(), enabled) {
-        Ok(()) => ok(
-            &if enabled {
-                format!("已启用到 {name}，下次对话生效。")
-            } else {
-                format!("已在 {name} 停用。")
-            },
-            current_skills_payload(&manager),
-        ),
-        Err(error) => failed(
-            &format!("Skill 启停失败：{error:#}"),
-            current_skills_payload(&manager),
-        ),
-    }
+    include_inventory: Option<bool>,
+) -> Result<CommandResult<Option<SkillsPayload>>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let manager = default_skills_manager();
+        let name = match agent.as_str() {
+            "claude" => "Claude Code",
+            "grok" => "Grok",
+            _ => "Codex",
+        };
+        let result = manager.set_enabled_for(agent.trim(), id.trim(), enabled);
+        let payload = include_inventory.unwrap_or(true).then(|| current_skills_payload(&manager));
+        match result {
+            Ok(()) => ok(
+                &if enabled {
+                    format!("已启用到 {name}，下次对话生效。")
+                } else {
+                    format!("已在 {name} 停用。")
+                },
+                payload,
+            ),
+            Err(error) => failed(
+                &format!("Skill 启停失败：{error:#}"),
+                payload,
+            ),
+        }
+    }).await.map_err(|error| format!("Skill 启停任务失败：{error}"))
 }
 
 /// 上一次成功拉取的远端清单，按仓库 key 存。
@@ -8310,10 +8682,29 @@ pub fn set_relay_feature(
     }
 }
 
+// 同步 tauri 命令跑在主线程上，Windows 下主线程就是 WebView2 的界面线程：读日志、
+// 生成诊断报告（要枚举进程、探 helper 和调试端口，各带 1 秒超时）期间整个窗口都不响应，
+// 进「日志与诊断」时就会卡一下（#2922）。这几个命令都放到阻塞线程池里做。
 #[tauri::command]
-pub fn read_latest_logs(request: LogRequest) -> CommandResult<LogsPayload> {
+pub async fn read_latest_logs(request: LogRequest) -> CommandResult<LogsPayload> {
     let path = codex_plus_core::paths::default_diagnostic_log_path();
-    read_latest_logs_at(&path, request)
+    let lines = request.lines;
+    let task_path = path.clone();
+    match tauri::async_runtime::spawn_blocking(move || read_latest_logs_at(&task_path, request))
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => failed(
+            &format!("读取日志失败：{error}"),
+            LogsPayload {
+                path: path.to_string_lossy().to_string(),
+                text: String::new(),
+                lines,
+                truncated: false,
+                file_size: 0,
+            },
+        ),
+    }
 }
 
 fn read_latest_logs_at(path: &Path, request: LogRequest) -> CommandResult<LogsPayload> {
@@ -8342,9 +8733,14 @@ fn read_latest_logs_at(path: &Path, request: LogRequest) -> CommandResult<LogsPa
 }
 
 #[tauri::command]
-pub fn clear_logs() -> CommandResult<LogsPayload> {
+pub async fn clear_logs() -> CommandResult<LogsPayload> {
     let path = codex_plus_core::paths::default_diagnostic_log_path();
-    match codex_plus_core::diagnostic_log::clear_diagnostic_log() {
+    // 清理要拿日志全局锁，别在界面线程上等。
+    let cleared =
+        tauri::async_runtime::spawn_blocking(codex_plus_core::diagnostic_log::clear_diagnostic_log)
+            .await
+            .unwrap_or_else(|error| Err(std::io::Error::other(error.to_string())));
+    match cleared {
         Ok(()) => ok(
             "日志已清理。",
             LogsPayload {
@@ -8369,13 +8765,16 @@ pub fn clear_logs() -> CommandResult<LogsPayload> {
 }
 
 #[tauri::command]
-pub fn copy_diagnostics() -> CommandResult<DiagnosticsPayload> {
-    ok(
-        "诊断报告已生成。",
-        DiagnosticsPayload {
-            report: diagnostics_report(),
-        },
-    )
+pub async fn copy_diagnostics() -> CommandResult<DiagnosticsPayload> {
+    match tauri::async_runtime::spawn_blocking(diagnostics_report).await {
+        Ok(report) => ok("诊断报告已生成。", DiagnosticsPayload { report }),
+        Err(error) => failed(
+            &format!("生成诊断报告失败：{error}"),
+            DiagnosticsPayload {
+                report: String::new(),
+            },
+        ),
+    }
 }
 
 #[tauri::command]
@@ -8840,14 +9239,34 @@ pub fn switch_relay_profile(
                 }),
             );
             // 在 Codex 供应商页切到别的供应商等于断开网关，切回「Codex++ 网关」等于重新接入。
-            let _ = codex_plus_core::gateway::apply::note_codex_switched(
+            let binding_update = codex_plus_core::gateway::apply::note_codex_switched(
                 &codex_plus_core::gateway::store::GatewayStore::default(),
                 &result.settings.active_relay_id,
                 &previous_active_relay_id,
             );
             // 新配置已经写进 config.toml：需要本地代理时立即让它常驻，
             // 这样不经过 Codex++ 启动的客户端也能直接用。
-            sync_resident_helper();
+            let helper = sync_resident_helper();
+            if result.settings.active_relay_id == codex_plus_core::gateway::apply::CODEX_GATEWAY_RELAY_ID {
+                if let Err(error) = binding_update {
+                    return failed(
+                        &format!("供应商已切换，但网关绑定更新失败：{error:#}"),
+                        relay_switch_payload(result.settings, status, result.backup_path),
+                    );
+                }
+                if helper.is_none() {
+                    return failed(
+                        "供应商已切换，但本地网关没能启动，请查看诊断日志",
+                        relay_switch_payload(result.settings, status, result.backup_path),
+                    );
+                }
+                if let Err(error) = codex_plus_core::gateway::connection_generation::publish(&home) {
+                    return failed(
+                        &format!("供应商已切换，但通知网关重新连接失败：{error:#}"),
+                        relay_switch_payload(result.settings, status, result.backup_path),
+                    );
+                }
+            }
             let imported_name = outcome.imported_profile_id.as_ref().and_then(|id| {
                 result
                     .settings
@@ -10960,6 +11379,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn multi_instance_commands_reject_main_with_the_real_controls() {
+        let stop = stop_codex_multi_instance_blocking(" main ");
+        assert_eq!(stop.status, "failed");
+        assert_eq!(stop.message, "主 Codex 请使用侧栏的「停止 Codex」。");
+        assert!(stop.payload.instances.is_empty());
+
+        let restart = restart_codex_multi_instance_blocking("main");
+        assert_eq!(restart.status, "failed");
+        assert_eq!(restart.message, "主 Codex 请使用顶部的「重启 Codex」。");
+    }
+
+    #[test]
     fn skill_install_failure_message_preserves_the_error_chain() {
         let error = anyhow::anyhow!("root cause")
             .context("download context")
@@ -11433,6 +11864,39 @@ cwd = \"/tmp\"
     }
 
     #[test]
+    fn manager_preferences_save_preserves_the_latest_explicit_native_login() {
+        let _guard = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let previous = codex_plus_core::paths::set_settings_path_for_tests(
+            Some(temp.path().join("settings.json")),
+        );
+        let store = SettingsStore::default();
+        store.save(&BackendSettings {
+            enhancements_enabled: false,
+            codex_app_auto_takeover: false,
+            ..BackendSettings::default()
+        }).unwrap();
+        let stale = store.load().unwrap();
+        let mut outcomes = Vec::new();
+        for selection in [
+            Some(codex_plus_core::settings::NativeAuthSelection::Account { account_ref: "fixture-a".into() }),
+            Some(codex_plus_core::settings::NativeAuthSelection::None),
+        ] {
+            let mut current = store.load().unwrap();
+            current.native_auth_selection = selection.clone();
+            store.save(&current).unwrap();
+            let revision = store.revision().unwrap();
+            let result = save_settings(stale.clone(), Some(revision));
+            outcomes.push((result.status, store.load().unwrap().native_auth_selection, selection));
+        }
+        codex_plus_core::paths::set_settings_path_for_tests(previous);
+        for (status, actual, expected) in outcomes {
+            assert_eq!(status, "ok");
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
     fn provider_sync_success_reports_backup_directory_when_something_changed() {
         let mut sync = provider_sync_result_for_test(
             codex_plus_data::ProviderSyncStatus::Synced,
@@ -11574,12 +12038,18 @@ base_url = "https://example.invalid/v1"
     #[test]
     fn restart_absent_app_uses_launch_but_explicit_sync_still_restarts() {
         assert_eq!(
-            restart_disposition(false, false),
+            restart_disposition(false, false, false),
             RestartDisposition::LaunchOnly
         );
         for (sync, running) in [(true, false), (false, true), (true, true)] {
             assert_eq!(
-                restart_disposition(sync, running),
+                restart_disposition(sync, running, false),
+                RestartDisposition::StopAndRestart
+            );
+        }
+        for (sync, running) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(
+                restart_disposition(sync, running, true),
                 RestartDisposition::StopAndRestart
             );
         }
@@ -13466,6 +13936,37 @@ model_reasoning_effort = "high"
     }
 
     #[test]
+    fn multi_instance_gateway_uses_the_manager_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let main_home = temp.path().join("main-codex");
+        let instance_home = temp.path().join("instance/codex-home");
+        let catalog = main_home.join("model-catalogs/codex-plus-gateway.json");
+        std::fs::create_dir_all(catalog.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&instance_home).unwrap();
+        std::fs::write(&catalog, r#"{"models":[{"slug":"old"}]}"#).unwrap();
+        std::fs::write(main_home.join("config.toml"),
+            "model_catalog_json = 'model-catalogs/codex-plus-gateway.json'\n").unwrap();
+        let profile = RelayProfile {
+            id: codex_plus_core::gateway::apply::CODEX_GATEWAY_RELAY_ID.into(),
+            name: "gateway".into(),
+            relay_mode: RelayMode::PureApi,
+            protocol: codex_plus_core::settings::RelayProtocol::Responses,
+            model: "old".into(),
+            model_list: "old\nother".into(),
+            config_contents: "model_provider = 'custom'\nmodel = 'old'\n[model_providers.custom]\nname = 'gateway'\nwire_api = 'responses'\nbase_url = 'http://127.0.0.1:61234/gw/codex/v1'\n".into(),
+            auth_contents: r#"{"OPENAI_API_KEY":"test"}"#.into(),
+            api_key: "test".into(),
+            ..RelayProfile::default()
+        };
+
+        write_multi_instance_codex_home(&instance_home, &main_home, &profile, "", 61235, false).unwrap();
+        assert_eq!(codex_plus_core::model_catalog::gateway_catalog_path(&instance_home), Some(catalog.clone()));
+        std::fs::write(&catalog, r#"{"models":[{"slug":"new"}]}"#).unwrap();
+        let shared = codex_plus_core::model_catalog::gateway_catalog_path(&instance_home).unwrap();
+        assert!(std::fs::read_to_string(shared).unwrap().contains(r#""new""#));
+    }
+
+    #[test]
     fn multi_instance_official_profile_still_copies_main_login() {
         let temp = tempfile::tempdir().unwrap();
         let main_home = temp.path().join("main-codex");
@@ -14377,9 +14878,17 @@ model_reasoning_effort = "high"
         // 修复前的表现：身份对不上就一直是「未知」。
         assert_eq!(multi_instance_snapshot_status(&orphan, false), "unknown");
 
+        // 已停止但清单仍留着对不上的旧身份（#2940）：同样需要核验清理。
         let mut stopped = orphan.clone();
         stopped.status = "stopped".into();
+        assert_eq!(multi_instance_orphaned_identities(&stopped).len(), 2);
+        // 已停止且清单无身份：本来就显示已停止，不再核验。
+        stopped.identity = None;
         assert!(multi_instance_orphaned_identities(&stopped).is_empty());
+        // 已停止且身份仍与清单一致：交给原有路径。
+        let mut stopped_ready = ready.clone();
+        stopped_ready.status = "stopped".into();
+        assert!(multi_instance_orphaned_identities(&stopped_ready).is_empty());
 
         let mut main = orphan.clone();
         main.is_main = true;
@@ -14466,6 +14975,129 @@ model_reasoning_effort = "high"
         }));
     }
 
+    /// 模拟 #2940：重启前实例已停止（清单 status stopped / running false / pid null），
+    /// 但清单与回执里仍留着旧身份；重启后安装路径变了，身份对不上清单。
+    fn stopped_orphaned_multi_instance_fixture(root: &Path) -> CodexMultiInstance {
+        let mut instance = stopped_multi_instance_fixture(root);
+        instance.status = "stopped".into();
+        instance.running = false;
+        instance.pid = None;
+        instance.worker_birth_id = None;
+        instance.app_path = Some(
+            root.join("Codex-removed-version.app")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        save_multi_instance_manifest(root, &instance).unwrap();
+        instance
+    }
+
+    #[test]
+    fn stopped_record_with_stale_identity_is_cleared_and_shown_stopped() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = stopped_orphaned_multi_instance_fixture(temp.path());
+        // 修复前的表现：清单已停止，列表却一直是「未知」，重新启动也不放行。
+        assert_eq!(multi_instance_snapshot_status(&original, false), "unknown");
+        assert!(!multi_instance_relaunch_is_safe_with(
+            &original,
+            stale_multi_instance_is_absent
+        ));
+
+        let probes = std::cell::Cell::new(0);
+        let current = load_multi_instance_manifest_with_probes(
+            temp.path(),
+            |_| panic!("mismatched identity must not use the regular probe"),
+            |instance| {
+                assert_eq!(instance.identity, original.identity);
+                probes.set(probes.get() + 1);
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(probes.get(), 2);
+        assert_eq!(current.status, "stopped");
+        assert!(!current.running);
+        assert_eq!(current.identity, None);
+        assert_eq!(current.pid, None);
+        assert_eq!(multi_instance_snapshot_status(&current, false), "stopped");
+        assert!(!multi_instance_is_running(&current));
+
+        let receipt = load_multi_launch_result(temp.path()).unwrap();
+        assert_eq!(receipt.status, "stopped");
+        assert!(receipt.identity.is_none() && receipt.pid.is_none());
+        assert!(multi_instance_stopped_receipt_matches(&current, &receipt));
+
+        // 再读一次不再探测；「结束实例」最后写回执的一步成功，重新启动放行。
+        let again = load_multi_instance_manifest_with_probes(
+            temp.path(),
+            |_| panic!("already synchronized"),
+            |_| panic!("already synchronized"),
+        )
+        .unwrap();
+        assert_eq!(multi_instance_snapshot_status(&again, false), "stopped");
+        finish_multi_instance_cleanup(temp.path(), &again, Ok(()), |_| Ok(true)).unwrap();
+        assert!(multi_instance_relaunch_is_safe_with(&again, |_| {
+            panic!("identity was dropped after confirmed exit")
+        }));
+    }
+
+    #[test]
+    fn stopped_record_with_stale_identity_stays_untouched_while_exit_is_uncertain() {
+        for failed_probe in [0, 1, 2] {
+            let temp = tempfile::tempdir().unwrap();
+            let original = stopped_orphaned_multi_instance_fixture(temp.path());
+            let manifest = std::fs::read(multi_instance_manifest_path(temp.path())).unwrap();
+            let receipt = std::fs::read(temp.path().join(MULTI_LAUNCH_RESULT_FILE)).unwrap();
+            let probes = std::cell::Cell::new(0);
+            let current = load_multi_instance_manifest_with_probes(
+                temp.path(),
+                |_| panic!("stopped records never use the regular probe"),
+                |_| {
+                    probes.set(probes.get() + 1);
+                    if failed_probe == 0 {
+                        anyhow::bail!("query denied");
+                    }
+                    // 旧身份那一代进程仍在（PID 未复用）、数据目录或端口仍被占用。
+                    Ok(probes.get() != failed_probe)
+                },
+            )
+            .unwrap();
+            assert_eq!(current.identity, original.identity);
+            assert_eq!(multi_instance_snapshot_status(&current, false), "unknown");
+            assert_eq!(
+                std::fs::read(multi_instance_manifest_path(temp.path())).unwrap(),
+                manifest
+            );
+            assert_eq!(
+                std::fs::read(temp.path().join(MULTI_LAUNCH_RESULT_FILE)).unwrap(),
+                receipt
+            );
+        }
+    }
+
+    #[test]
+    fn stopped_record_with_matching_identity_is_not_reprobed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut instance = stopped_multi_instance_fixture(temp.path());
+        instance.status = "stopped".into();
+        instance.running = false;
+        instance.pid = None;
+        instance.worker_birth_id = None;
+        save_multi_instance_manifest(temp.path(), &instance).unwrap();
+        let manifest = std::fs::read(multi_instance_manifest_path(temp.path())).unwrap();
+        let current = load_multi_instance_manifest_with_probes(
+            temp.path(),
+            |_| panic!("already stopped"),
+            |_| panic!("identity still matches the manifest"),
+        )
+        .unwrap();
+        assert_eq!(current.identity, instance.identity);
+        assert_eq!(
+            std::fs::read(multi_instance_manifest_path(temp.path())).unwrap(),
+            manifest
+        );
+    }
+
     #[test]
     fn orphaned_record_stays_untouched_while_exit_is_uncertain() {
         for failed_probe in [0, 1, 2] {
@@ -14527,6 +15159,209 @@ model_reasoning_effort = "high"
         .unwrap();
         assert_eq!(saved.generation, original.generation + 1);
         assert_ne!(saved.status, "stopped");
+    }
+
+    fn verbatim_windows_path(path: &Path) -> PathBuf {
+        // Windows 上 canonicalize 的结果本身就带 `\\?\`，不能再叠一层（否则成了 `\\?\\\?\C:\…`）。
+        let text = path.display().to_string();
+        if text.starts_with(r"\\?\") {
+            return path.to_path_buf();
+        }
+        PathBuf::from(format!(r"\\?\{text}"))
+    }
+
+    /// #3021: Store upgrade deletes the package directory. The manifest still
+    /// names that package, and the saved executable is `\\?\...\app\ChatGPT.exe`.
+    fn vanished_store_package_instance(root: &Path) -> CodexMultiInstance {
+        let mut instance = ready_multi_instance_fixture(root);
+        let package = root.join("OpenAI.Codex_26.1103.4239.0_x64__2p2nqsd0c76g0");
+        assert!(!package.exists());
+        instance.app_path = Some(package.to_string_lossy().into_owned());
+        instance.status = "starting".into();
+        instance.running = false;
+        instance.identity.as_mut().unwrap().executable =
+            verbatim_windows_path(&package.join("app").join("ChatGPT.exe"));
+        let identity = instance.identity.clone().unwrap();
+        let receipt = instance.launch_result.as_mut().unwrap();
+        receipt.status = "stopped".into();
+        receipt.message = "Codex 多开实例已停止，清理完成。".into();
+        receipt.identity = Some(identity);
+        receipt.pid = Some(instance.identity.as_ref().unwrap().process_id);
+        receipt.debug_port = Some(instance.debug_port);
+        receipt.helper_port = Some(instance.helper_port);
+        save_multi_instance_manifest(root, &instance).unwrap();
+        write_multi_launch_result(
+            &root.join(MULTI_LAUNCH_RESULT_FILE),
+            instance.launch_result.as_ref().unwrap(),
+        )
+        .unwrap();
+        instance
+    }
+
+    #[test]
+    fn vanished_store_package_identity_matches_verbatim_app_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let instance = vanished_store_package_instance(temp.path());
+        let identity = instance.identity.clone().unwrap();
+        let package = PathBuf::from(instance.app_path.clone().unwrap());
+        let built = codex_plus_core::app_paths::build_codex_executable(&package);
+        assert_eq!(built, package.join("ChatGPT.exe"));
+        assert_ne!(
+            normalized_identity_path(&built),
+            normalized_identity_path(&identity.executable)
+        );
+        assert!(multi_manifest_identity_matches(&instance, &identity));
+        assert!(multi_instance_orphaned_identities(&instance).is_empty());
+        assert_eq!(multi_instance_snapshot_status(&instance, false), "unknown");
+
+        let mut prefix_only = instance.clone();
+        prefix_only.identity.as_mut().unwrap().executable = verbatim_windows_path(&built);
+        assert!(multi_manifest_identity_matches(
+            &prefix_only,
+            prefix_only.identity.as_ref().unwrap()
+        ));
+
+        #[cfg(windows)]
+        {
+            let mut cased = prefix_only.clone();
+            let upper = built.to_string_lossy().to_ascii_uppercase();
+            cased.identity.as_mut().unwrap().executable = PathBuf::from(format!(r"\\?\{upper}"));
+            assert!(multi_manifest_identity_matches(
+                &cased,
+                cased.identity.as_ref().unwrap()
+            ));
+        }
+        #[cfg(not(windows))]
+        {
+            let mut cased = prefix_only;
+            let lower = built
+                .to_string_lossy()
+                .replace("ChatGPT.exe", "chatgpt.exe");
+            cased.identity.as_mut().unwrap().executable = verbatim_windows_path(Path::new(&lower));
+            assert!(!multi_manifest_identity_matches(
+                &cased,
+                cased.identity.as_ref().unwrap()
+            ));
+        }
+
+        let mut prefixed_data = instance.clone();
+        let canonical = Path::new(prefixed_data.user_data_dir.as_ref().unwrap())
+            .canonicalize()
+            .unwrap();
+        prefixed_data.user_data_dir = Some(canonical.display().to_string());
+        prefixed_data.identity.as_mut().unwrap().user_data_dir = verbatim_windows_path(&canonical);
+        assert!(multi_manifest_identity_matches(
+            &prefixed_data,
+            prefixed_data.identity.as_ref().unwrap()
+        ));
+
+        let mut outside = instance.clone();
+        outside.identity.as_mut().unwrap().executable =
+            verbatim_windows_path(&temp.path().join("other").join("ChatGPT.exe"));
+        assert!(!multi_manifest_identity_matches(
+            &outside,
+            outside.identity.as_ref().unwrap()
+        ));
+
+        let live = temp
+            .path()
+            .join("OpenAI.Codex_26.1103.7773.0_x64__2p2nqsd0c76g0");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("ChatGPT.exe"), "live").unwrap();
+        let mut live_instance = instance;
+        live_instance.app_path = Some(live.to_string_lossy().into_owned());
+        live_instance.identity.as_mut().unwrap().executable =
+            verbatim_windows_path(&live.join("app").join("ChatGPT.exe"));
+        assert!(!multi_manifest_identity_matches(
+            &live_instance,
+            live_instance.identity.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn vanished_store_package_reconciles_when_the_process_is_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = vanished_store_package_instance(temp.path());
+        let current = load_multi_instance_manifest_with_absence(temp.path(), |_| Ok(true)).unwrap();
+        assert_eq!(current.status, "stopped");
+        assert!(!current.running);
+        assert_eq!(current.pid, None);
+        assert_eq!(current.worker_birth_id, None);
+        assert_eq!(
+            current.identity.as_ref().unwrap().executable,
+            original.identity.unwrap().executable
+        );
+        assert_eq!(multi_instance_snapshot_status(&current, false), "stopped");
+        assert!(multi_instance_relaunch_is_safe_with(&current, |_| Ok(true)));
+        finish_multi_instance_cleanup(temp.path(), &current, Ok(()), |_| Ok(true)).unwrap();
+        assert_eq!(
+            load_multi_launch_result(temp.path()).unwrap().status,
+            "stopped"
+        );
+    }
+
+    #[test]
+    fn multi_instance_cleanup_keeps_underlying_error_when_receipt_write_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let instance = ready_multi_instance_fixture(temp.path());
+        let mut replaced = instance.clone();
+        replaced.generation += 1;
+        save_multi_instance_manifest(temp.path(), &replaced).unwrap();
+        let receipt_before = std::fs::read(temp.path().join(MULTI_LAUNCH_RESULT_FILE)).unwrap();
+        let error = finish_multi_instance_cleanup(
+            temp.path(),
+            &instance,
+            Err(anyhow::anyhow!("worker 未正常结束")),
+            |_| Ok(true),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("worker 未正常结束"), "{message}");
+        assert!(message.contains("回执未写入"), "{message}");
+        assert_eq!(
+            std::fs::read(temp.path().join(MULTI_LAUNCH_RESULT_FILE)).unwrap(),
+            receipt_before
+        );
+    }
+
+    #[test]
+    fn orphan_probe_errors_are_logged_and_do_not_clear_the_record() {
+        struct RestoreDiagnosticLog(Option<PathBuf>);
+        impl Drop for RestoreDiagnosticLog {
+            fn drop(&mut self) {
+                codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(self.0.take());
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("instance");
+        let log_path = temp.path().join("diag.log");
+        let _restore = RestoreDiagnosticLog(
+            codex_plus_core::diagnostic_log::swap_diagnostic_log_path_for_tests(Some(
+                log_path.clone(),
+            )),
+        );
+        let original = orphaned_multi_instance_fixture(&root);
+        assert!(!multi_instance_orphaned_identities(&original).is_empty());
+        let manifest = std::fs::read(multi_instance_manifest_path(&root)).unwrap();
+        let current = load_multi_instance_manifest_with_probes(
+            &root,
+            |_| panic!("mismatched identity must not use the regular probe"),
+            |_| anyhow::bail!("query denied"),
+        )
+        .unwrap();
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log.contains("manager.multi_instance_stale_record_probe_failed"),
+            "{log}"
+        );
+        assert!(log.contains("query denied"), "{log}");
+        assert_eq!(current.identity, original.identity);
+        assert_ne!(current.status, "stopped");
+        assert_eq!(
+            std::fs::read(multi_instance_manifest_path(&root)).unwrap(),
+            manifest
+        );
     }
 
     #[test]

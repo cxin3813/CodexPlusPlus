@@ -19,8 +19,10 @@ pub mod cdp;
 #[cfg(any(target_os = "windows", test))]
 mod claude_ion_asar;
 pub mod claude_hooks;
+pub mod claude_local_backend;
 pub mod claude_localization;
 pub mod codex_app_state;
+pub mod config_doctor;
 pub mod codex_home;
 pub mod codex_local_storage;
 pub mod codex_sqlite;
@@ -65,6 +67,7 @@ pub mod model_pricing;
 pub mod model_suffix;
 pub mod models;
 pub mod multi_worker;
+pub mod native_auth;
 pub mod native_browser;
 pub mod native_browser_connection;
 pub(crate) mod native_fast;
