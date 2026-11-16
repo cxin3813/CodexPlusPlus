@@ -74,6 +74,13 @@
 - 旧正式 app 与状态备份分别为 `dist/upgrade-v2.3.1/app-before-formal/Codex++.app` 和 `state-before-formal/`；开发实例也有独立备份，均不包含更新缓存和运行期 socket。
 - 源码恢复标签 `local/pre-update-v2.3.1-20261106`，交付标签 `local/v2.3.1-no-promotions-verified-20261106`（原 `local/v2.3.1-no-promotions-20261106` 提前指向验收文档提交，不含升级代码，勿用于构建）。未逐项实测官方 Codex 的状态栏读数及所有上游新功能。
 
+### 2026-11-16 升级 v2.6.10
+
+- 上游稳定版 v2.6.10 已合并，保留去推广与仅增强模式修复；上游新增的使用模式持久保存也一并采用。合并候选 `e494d086`，最终 main 合并后已安装验收。
+- 前端 2090 项通过、2 项跳过；TypeScript、Vite、数据与核心定制回归通过；Release 构建通过。相关核心结果：assets 10、ads 9、CDP、主题、拓展页面、内置拓展、用量设置均通过。
+- `/Applications/Codex++.app` 已更新为 v2.6.10，后端健康，首页无推广，正式配置目录 `~/.codex-session-delete/` 保持不变，`managerAgentFocus=enhance`、`relayProfilesEnabled=false` 保持不变。旧 app 与状态在 `dist/upgrade-v2.6.10/`。
+- 恢复标签 `local/pre-update-v2.6.10-20261116`，交付标签 `local/v2.6.10-no-promotions-verified-20261116`。未逐项实测官方 Codex 状态栏和所有新增功能。
+
 ## 当前补丁与已退役补丁
 
 ### 用量：采用官方实现
