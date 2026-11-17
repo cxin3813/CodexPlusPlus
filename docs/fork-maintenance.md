@@ -81,6 +81,15 @@
 - `/Applications/Codex++.app` 已更新为 v2.6.10，后端健康，首页无推广，正式配置目录 `~/.codex-session-delete/` 保持不变，`managerAgentFocus=enhance`、`relayProfilesEnabled=false` 保持不变。旧 app 与状态在 `dist/upgrade-v2.6.10/`。
 - 恢复标签 `local/pre-update-v2.6.10-20261116`，交付标签 `local/v2.6.10-no-promotions-verified-20261116`。未逐项实测官方 Codex 状态栏和所有新增功能。
 
+### 2026-11-17 升级 v2.7.1
+
+- 合并正式标签 v2.7.1，候选提交 `6e1a2c07`。上游仍保留推广取数，仍存在仅增强模式读取设置触发供应商自动导入的问题，且未包含 CDP 不确定状态保护；三组个人定制均保留。
+- 新版拓展市场、设置分组导航、供应商 / 远程控制 / 任务入口保留；只去掉推广页面及入口。重新组装 55 个注入分片。
+- 前端 2264 项通过、2 项跳过；TypeScript 与 Vite 构建通过。数据模块 535 项通过、2 项忽略。相关核心测试 262 项通过：资源 10、自动接管 21、端口探测 12、广告 9、注入桥接 172、主题 19、拓展页面 5、内置拓展 11、用量设置 3。不是整个 Rust workspace 全量测试。
+- Release 构建、签名、固定开发实例启动和实际首页渲染验收通过。已更新 `/Applications/Codex++.app`，包版本和运行版本 2.7.1，后端健康、管理页五项健康检查正常。正式版没有测试目录覆盖，继续使用 `~/.codex-session-delete/`；`managerAgentFocus=enhance`、`relayProfilesEnabled=false` 保持。未退出或重启用户正在使用的官方 Codex。
+- 上一版正式 app：`dist/upgrade-v2.7.1/app-before-formal/Codex++.app`；正式状态备份 `state-before-formal/`，开发实例另有独立备份，排除更新下载缓存和运行期 socket。
+- 恢复标签 `local/pre-update-v2.7.1-20261117` 指向升级前 main；交付标签 `local/v2.7.1-no-promotions-verified-20261117`。未逐项实测官方 Codex 中的用量读数、新任务面板或远程聊天助手。
+
 ## 当前补丁与已退役补丁
 
 ### 用量：采用官方实现
