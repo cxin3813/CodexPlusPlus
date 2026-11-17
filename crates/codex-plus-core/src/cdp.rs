@@ -7,7 +7,8 @@ use std::time::Duration;
 
 const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 const CDP_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
-const CDP_PROBE_MAX_BYTES: usize = 256 * 1024;
+// “关于”窗口的 data: URL 内嵌图标，单个 target 已约 940 KB。
+const CDP_PROBE_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct CdpTarget {
@@ -46,24 +47,46 @@ impl CdpBrowserIdentity {
 
 /// Returns whether the requested loopback port exposes a CDP target list.
 pub fn endpoint_available(debug_port: u16) -> bool {
-    [
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), debug_port),
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), debug_port),
-    ]
-    .into_iter()
-    .any(|address| probe_endpoint(address, debug_port))
+    probe_endpoint_state(debug_port) == EndpointState::Ready
 }
 
-fn probe_endpoint(address: SocketAddr, debug_port: u16) -> bool {
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, CDP_PROBE_TIMEOUT) else {
-        return false;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointState {
+    Ready,
+    Unavailable,
+    Inconclusive,
+}
+
+/// 超限、无响应、响应不可解析都不能证明没开调试端口，禁止据此退出应用。
+pub fn probe_endpoint_state(debug_port: u16) -> EndpointState {
+    let mut state = EndpointState::Unavailable;
+    for address in [
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), debug_port),
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), debug_port),
+    ] {
+        match probe_endpoint(address, debug_port) {
+            EndpointState::Ready => return EndpointState::Ready,
+            EndpointState::Inconclusive => state = EndpointState::Inconclusive,
+            EndpointState::Unavailable => {}
+        }
+    }
+    state
+}
+
+fn probe_endpoint(address: SocketAddr, debug_port: u16) -> EndpointState {
+    let mut stream = match TcpStream::connect_timeout(&address, CDP_PROBE_TIMEOUT) {
+        Ok(stream) => stream,
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            return EndpointState::Unavailable;
+        }
+        Err(_) => return EndpointState::Inconclusive,
     };
     let _ = stream.set_read_timeout(Some(CDP_PROBE_TIMEOUT));
     let _ = stream.set_write_timeout(Some(CDP_PROBE_TIMEOUT));
     let request =
         format!("GET /json HTTP/1.1\r\nHost: 127.0.0.1:{debug_port}\r\nConnection: close\r\n\r\n");
     if stream.write_all(request.as_bytes()).is_err() {
-        return false;
+        return EndpointState::Inconclusive;
     }
 
     let mut response = Vec::new();
@@ -82,11 +105,15 @@ fn probe_endpoint(address: SocketAddr, debug_port: u16) -> bool {
             {
                 break;
             }
-            Err(_) => return false,
+            Err(_) => return EndpointState::Inconclusive,
         }
     }
 
-    response_contains_codex_target(&response, debug_port)
+    if response_contains_codex_target(&response, debug_port) {
+        EndpointState::Ready
+    } else {
+        EndpointState::Inconclusive
+    }
 }
 
 fn response_contains_codex_target(response: &[u8], debug_port: u16) -> bool {
@@ -613,6 +640,33 @@ mod endpoint_tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         (port, handle)
+    }
+
+    #[test]
+    fn endpoint_available_accepts_about_window_with_large_data_url() {
+        let (port, server) = serve_once(|port| {
+            serde_json::to_string(&json!([
+                {"id": "about", "type": "page", "title": "关于 ChatGPT",
+                 "url": format!("data:text/html,{}", "x".repeat(940_000)),
+                 "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/page/about")},
+                {"id": "main", "type": "page", "title": "ChatGPT",
+                 "url": "app://-/index.html",
+                 "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/page/main")}
+            ]))
+            .unwrap()
+        });
+        assert_eq!(probe_endpoint_state(port), EndpointState::Ready);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn listening_endpoint_without_http_response_is_inconclusive() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // 保持监听但不处理请求，模拟主线程被原生模态窗口阻塞。
+        assert_eq!(probe_endpoint_state(port), EndpointState::Inconclusive);
+        drop(listener);
+        assert_eq!(probe_endpoint_state(port), EndpointState::Unavailable);
     }
 
     #[test]

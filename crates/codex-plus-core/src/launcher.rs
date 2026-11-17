@@ -1696,9 +1696,14 @@ impl LaunchHooks for DefaultLaunchHooks {
         if app_dir.extension().and_then(|value| value.to_str()) == Some("app")
             && !isolated_multi_instance
         {
+            let app_running = is_macos_app_running(app_dir).await;
+            let cdp_probe = crate::cdp::probe_endpoint_state(debug_port);
+            if app_running && cdp_probe == crate::cdp::EndpointState::Inconclusive {
+                anyhow::bail!("调试端口暂未响应，请关闭原生对话框后重试；已保留官方 App。");
+            }
             let launch_action = select_macos_debug_launch_action(
-                is_macos_app_running(app_dir).await,
-                crate::cdp::endpoint_available(debug_port),
+                app_running,
+                cdp_probe == crate::cdp::EndpointState::Ready,
             );
             let cleanup_policy = match launch_action {
                 MacosDebugLaunchAction::LaunchNew => MacosCleanupPolicy::QuitIfNotPreviouslyRunning,

@@ -65,6 +65,8 @@ fn main() {
             },
             app: probe.app.clone(),
             cdp_ready: probe.cdp_ready,
+            cdp_probe_inconclusive: codex_plus_core::cdp::probe_endpoint_state(probe.actual_port)
+                == codex_plus_core::cdp::EndpointState::Inconclusive,
             actual_port: probe.actual_port,
             multi_instance_running: probe.other_instance,
             takeover_in_progress: false,

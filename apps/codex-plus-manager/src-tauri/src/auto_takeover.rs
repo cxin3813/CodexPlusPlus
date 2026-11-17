@@ -235,6 +235,9 @@ pub fn take_over_now() -> Result<(), String> {
     if inputs.cdp_ready && inputs.session.is_running() {
         return Err("官方 App 已经被接管了。".to_string());
     }
+    if inputs.cdp_probe_inconclusive {
+        return Err("调试端口暂未响应，请关闭原生对话框后重试；已保留官方 App。".to_string());
+    }
     if !inputs.restart_budget_left_for_manual() {
         return Err("一小时内接管次数已达上限，已停止自动重试。".to_string());
     }
@@ -436,7 +439,8 @@ fn collect_inputs() -> Result<TakeoverInputs, String> {
         Some(app_dir) => probe_desktop_app(app_dir),
         None => AppProbe::Unknown,
     };
-    let cdp_ready = codex_plus_core::cdp::endpoint_available(actual_port);
+    let cdp_probe = codex_plus_core::cdp::probe_endpoint_state(actual_port);
+    let cdp_ready = cdp_probe == codex_plus_core::cdp::EndpointState::Ready;
     let current_pid = match &app {
         AppProbe::Running(key) => Some(key.pid),
         _ => None,
@@ -470,6 +474,7 @@ fn collect_inputs() -> Result<TakeoverInputs, String> {
         session,
         app,
         cdp_ready,
+        cdp_probe_inconclusive: cdp_probe == codex_plus_core::cdp::EndpointState::Inconclusive,
         actual_port,
         multi_instance_running,
         takeover_in_progress: crate::commands::launch_in_progress(),
@@ -668,7 +673,17 @@ fn spawn_takeover(actual_port: u16) {
     let started_at = Instant::now();
     // 这次到底是「重启官方 App」还是「附着到已带端口的实例」？
     // 后者不动用户窗口，不能算进重启额度，也不能记成重启（否则日志与预算都会失真）。
-    let restarting = !codex_plus_core::cdp::endpoint_available(actual_port);
+    let restarting = match codex_plus_core::cdp::probe_endpoint_state(actual_port) {
+        codex_plus_core::cdp::EndpointState::Ready => false,
+        codex_plus_core::cdp::EndpointState::Unavailable => true,
+        codex_plus_core::cdp::EndpointState::Inconclusive => {
+            log_event(
+                "takeover.skipped",
+                json!({ "reason": "cdp_probe_inconclusive" }),
+            );
+            return;
+        }
+    };
     with_inner(|state| {
         state.our_launch_at = Some(started_at);
         state.last_attempt = Some(started_at);
@@ -707,6 +722,14 @@ fn spawn_takeover(actual_port: u16) {
         };
         let latest = StatusStore::default().load_latest().ok().flatten();
         let app_dir = resolve_app_dir(latest.as_ref());
+        // 排队期间原生对话框可能已打开，退出前必须重新确认端口确实没有监听。
+        if restarting
+            && codex_plus_core::cdp::probe_endpoint_state(actual_port)
+                != codex_plus_core::cdp::EndpointState::Unavailable
+        {
+            log_event("takeover.skipped", json!({ "reason": "cdp_state_changed" }));
+            return;
+        }
         // 需要重启时先请官方 App 退出：macOS 走 AppleEvent quit，Windows 走 taskkill。
         // 只在真的没有调试端口时才做——已有端口的实例交给 launcher 复用，不动用户窗口。
         if restarting

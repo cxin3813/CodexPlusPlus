@@ -537,6 +537,8 @@ pub struct TakeoverInputs {
     pub app: AppProbe,
     /// `cdp::endpoint_available(actual_port)`——严格判据。
     pub cdp_ready: bool,
+    /// 端口有监听但未返回可验证的主窗口，或连接结果不确定：禁止退出应用。
+    pub cdp_probe_inconclusive: bool,
     /// 实际调试端口（不是硬编码的 9229：端口被占时会自动换位）。
     pub actual_port: u16,
     /// 存在 Codex++ 多开 worker 实例。
@@ -684,6 +686,9 @@ pub fn decide(inputs: &TakeoverInputs) -> TakeoverDecision {
     if inputs.cdp_ready && inputs.session.is_running() {
         return TakeoverDecision::Wait("already_attached");
     }
+    if inputs.cdp_probe_inconclusive {
+        return TakeoverDecision::Wait("cdp_probe_inconclusive");
+    }
     // 唤醒后的 CDP 恢复宽限：睡眠/唤醒后端口常短暂不可连，等它自己恢复。
     if matches!(inputs.ms_since_wake, Some(elapsed) if elapsed < WAKE_GRACE_MS) {
         return TakeoverDecision::Wait("wake_grace");
@@ -746,6 +751,7 @@ mod tests {
             session: SessionSnapshot::default(),
             app: running_instance(),
             cdp_ready: false,
+            cdp_probe_inconclusive: false,
             actual_port: 9229,
             multi_instance_running: false,
             takeover_in_progress: false,
@@ -788,6 +794,23 @@ mod tests {
         assert_eq!(decide(&inputs), TakeoverDecision::Wait("grace"));
 
         inputs.ms_since_our_launch = Some(TAKEOVER_GRACE_MS);
+        assert!(decide(&inputs).is_takeover());
+    }
+
+    #[test]
+    fn inconclusive_cdp_probe_never_restarts_running_app() {
+        let mut inputs = base_inputs();
+        inputs.cdp_probe_inconclusive = true;
+        inputs.active_policy = ActivePolicy::Immediate;
+        for owned in [false, true] {
+            inputs.session.owned = owned;
+            inputs.session.status = Some("running".to_string());
+            assert_eq!(
+                decide(&inputs),
+                TakeoverDecision::Wait("cdp_probe_inconclusive")
+            );
+        }
+        inputs.cdp_probe_inconclusive = false;
         assert!(decide(&inputs).is_takeover());
     }
 
