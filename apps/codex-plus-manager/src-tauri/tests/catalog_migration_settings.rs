@@ -22,7 +22,7 @@ fn load_settings_survives_failed_catalog_migration() {
     };
     SettingsStore::default().save(&settings).unwrap();
 
-    let result = load_settings();
+    let result = load_settings(None);
 
     codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(None);
     assert_eq!(result.status, "ok");

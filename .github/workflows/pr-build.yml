@@ -12,6 +12,10 @@ on:
       - "**/*.md"
   workflow_dispatch:
     inputs:
+      macos_only:
+        description: "仅构建 macOS 安装包"
+        type: boolean
+        default: false
       rust_test_filter:
         description: "只跑名字匹配的 Rust 用例并串行执行（留空跑全量），排查平台相关失败时用"
         default: ""
@@ -28,6 +32,7 @@ concurrency:
 
 jobs:
   windows-artifacts:
+    if: github.event_name != 'workflow_dispatch' || !inputs.macos_only
     name: Windows artifacts
     runs-on: windows-latest
     steps:
@@ -172,7 +177,9 @@ jobs:
           }
           Push-Location scripts/installer/windows
           try {
-            & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" CodexPlusPlus.nsi
+            # 版本资源只收 X.X.X.X：去掉预发布后缀；手动在分支上跑（版本是分支名）时用 0.0.0.0。
+            $viVersion = if ($version -match '^(\d+)\.(\d+)\.(\d+)') { "$($Matches[1]).$($Matches[2]).$($Matches[3]).0" } else { "0.0.0.0" }
+            & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" "/DVI_VERSION=$viVersion" CodexPlusPlus.nsi
             if ($LASTEXITCODE -ne 0) { throw "NSIS 打包失败，退出码 $LASTEXITCODE" }
           } finally {
             Pop-Location
@@ -251,15 +258,14 @@ jobs:
         if: github.event_name != 'workflow_dispatch'
         run: cargo check --workspace --all-targets
 
+      - name: Check settings integration test
+        if: github.event_name == 'workflow_dispatch'
+        run: cargo test --locked -p codex-plus-manager --test catalog_migration_settings
+
       - name: Build universal macOS DMG
         if: github.event_name == 'workflow_dispatch'
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          VERSION="${VERSION#V}"
-          VERSION="${VERSION//\//-}"
-          if [ -z "$VERSION" ] || [ "$VERSION" = "main" ]; then
-            VERSION="0.0.0-${GITHUB_RUN_NUMBER}"
-          fi
+          VERSION="$(node -p 'require("./apps/codex-plus-manager/package.json").version')"
           # 未设置 MACOS_SIGNING_IDENTITY，脚本自动退回 ad-hoc 签名。
           bash scripts/installer/macos/build-universal.sh "$VERSION"
 
@@ -299,6 +305,7 @@ jobs:
           if-no-files-found: error
 
   linux-deb:
+    if: github.event_name != 'workflow_dispatch' || !inputs.macos_only
     name: Linux DEB (Ubuntu 24.04, amd64)
     runs-on: ubuntu-24.04
     steps:
